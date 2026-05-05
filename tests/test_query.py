@@ -487,6 +487,30 @@ class TestEnsureRanks:
         ranks = list(DataSourceRanking.objects.filter(customer=customer).order_by("rank"))
         assert ranks[0].dataSource == DataSource.FITBIT
 
+    def test_preferred_source_uses_most_recent_active_connection(self, customer):
+        # Two active connections; preferred = most recently connected.
+        # Matches Customer._active_connection ordering (-connected_at, -pk).
+        earlier = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        later = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        WearableConnection.objects.create(
+            customer=customer,
+            data_source=DataSource.APPLE_HEALTH,
+            device_brand="apple",
+            status="active",
+            connected_at=earlier,
+        )
+        WearableConnection.objects.create(
+            customer=customer,
+            data_source=DataSource.FITBIT,
+            device_brand="fitbit",
+            status="active",
+            connected_at=later,
+        )
+        ensure_ranks(customer)
+        first = DataSourceRanking.objects.filter(customer=customer).order_by("rank").first()
+        assert first is not None
+        assert first.dataSource == DataSource.FITBIT
+
 
 # ---------------------------------------------------------------------------
 # get_activity_by_day / get_activity_records — skipped (requires PostgreSQL)

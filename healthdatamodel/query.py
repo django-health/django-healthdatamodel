@@ -185,11 +185,17 @@ def _sleep_for_day(customer: Any, day: date, boundary_hour: int) -> DailySleep:
 
 
 def _active_data_source(customer: Any) -> str:
-    """Return the data_source of the first active WearableConnection, or ''."""
+    """Return the data_source of the most-recently-connected active
+    WearableConnection, or ''.
+
+    Ordering matches the convention used by callers such as
+    ``Customer._active_connection``: when multiple active connections exist,
+    the most recently connected one wins, with ``pk`` as a stable tiebreaker.
+    """
     conn = WearableConnection.objects.filter(
         customer=customer,
         status=ConnectionStatus.ACTIVE,
-    ).order_by("connected_at").first()
+    ).order_by("-connected_at", "-pk").first()
     return conn.data_source if conn else ""
 
 
