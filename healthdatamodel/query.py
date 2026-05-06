@@ -39,10 +39,19 @@ Ranking / source utilities
 
 from __future__ import annotations
 
+import sys
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
-from enum import StrEnum
 from typing import Any, NamedTuple
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
+
 
 from django.db import connection
 from django.db.models import Case, F, FloatField, IntegerField, Q, Value, When, Window

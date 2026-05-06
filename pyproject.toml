@@ -1,16 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "django-healthdatamodel"
-version = "0.3.3"
-requires-python = ">=3.11"
+version = "0.3.4"
+description = "A Django app providing a unified data model for personal health and activity data."
+readme = "README.md"
+authors = [
+    { name = "Andy Reagan", email = "andy@andyreagan.com" },
+]
+classifiers = [
+    "Environment :: Web Environment",
+    "Framework :: Django",
+    "Framework :: Django :: 5.0",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+]
+requires-python = ">=3.10"
 dependencies = [
     "django",
     "pydantic>=2",
     "python-dateutil",
 ]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[project.urls]
+Homepage = "https://github.com/andyreagan/django-healthdatamodel"
+Repository = "https://github.com/andyreagan/django-healthdatamodel"
+Issues = "https://github.com/andyreagan/django-healthdatamodel/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["healthdatamodel"]

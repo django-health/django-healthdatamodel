@@ -7,4 +7,3 @@ dist/
 build/
 .pytest_cache/
 demo.sqlite3
-uv.lock
