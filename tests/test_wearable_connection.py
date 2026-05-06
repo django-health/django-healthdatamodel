@@ -97,7 +97,10 @@ class TestWearableConnectionMultiple:
             customer=second_user,
             data_source=DataSource.FITBIT,
         )
-        assert WearableConnection.objects.filter(data_source=DataSource.FITBIT).count() == 2
+        assert (
+            WearableConnection.objects.filter(data_source=DataSource.FITBIT).count()
+            == 2
+        )
 
 
 class TestWearableConnectionLifecycle:
@@ -149,7 +152,9 @@ class TestPreferredForSleep:
             device_brand=DeviceBrand.FITBIT,
             preferred_for_sleep=False,
         )
-        preferred = WearableConnection.objects.filter(customer=user, preferred_for_sleep=True)
+        preferred = WearableConnection.objects.filter(
+            customer=user, preferred_for_sleep=True
+        )
         assert preferred.count() == 1
         assert preferred.first().data_source == DataSource.APPLE_HEALTH
 

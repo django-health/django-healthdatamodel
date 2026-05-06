@@ -7,6 +7,7 @@ Activity tests require PostgreSQL (the source-ranking CTE uses
 ``EXTRACT(epoch FROM ...)::INTEGER``).  They are skipped here; the
 consuming project's pytest suite (which runs against PostgreSQL) covers them.
 """
+
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
@@ -39,7 +40,9 @@ TODAY = date(2025, 6, 10)
 YESTERDAY = TODAY - timedelta(days=1)
 
 # 2 pm UTC boundary — same as production default
-_DAY_START = datetime.combine(TODAY, time(14)).replace(tzinfo=timezone.utc) - timedelta(days=1)
+_DAY_START = datetime.combine(TODAY, time(14)).replace(tzinfo=timezone.utc) - timedelta(
+    days=1
+)
 _DAY_END = datetime.combine(TODAY, time(14)).replace(tzinfo=timezone.utc)
 
 NOW = datetime(2025, 6, 10, 8, 0, tzinfo=timezone.utc)
@@ -55,7 +58,14 @@ def customer():
     return User.objects.create_user(username="query-test-user")
 
 
-def _sleep_record(customer, start: datetime, end: datetime, value: str, sourceName: str = "apple", admin_create_date: datetime = NOW):
+def _sleep_record(
+    customer,
+    start: datetime,
+    end: datetime,
+    value: str,
+    sourceName: str = "apple",
+    admin_create_date: datetime = NOW,
+):
     return Record.objects.create(
         customer=customer,
         startDate=start,
@@ -109,7 +119,9 @@ class TestSleepHoursNoData:
         ):
             _sleep_record(
                 customer,
-                start=datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc),
+                start=datetime.combine(YESTERDAY, time(23)).replace(
+                    tzinfo=timezone.utc
+                ),
                 end=datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
                 value=non_sleep_value,
             )
@@ -182,7 +194,9 @@ class TestSleepHoursBasic:
         ):
             _sleep_record(
                 customer,
-                start=datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc),
+                start=datetime.combine(YESTERDAY, time(23)).replace(
+                    tzinfo=timezone.utc
+                ),
                 end=datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
                 value=subtype,
             )
@@ -352,8 +366,12 @@ class TestSleepByDay:
             end=datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
             value="HKCategoryValueSleepAnalysisAsleepUnspecified",
         )
-        assert get_sleep_by_day(customer, TODAY, TODAY)[TODAY].hours == pytest.approx(8.0)
-        assert get_sleep_hours_by_day(customer, TODAY, TODAY)[TODAY] == pytest.approx(8.0)
+        assert get_sleep_by_day(customer, TODAY, TODAY)[TODAY].hours == pytest.approx(
+            8.0
+        )
+        assert get_sleep_hours_by_day(customer, TODAY, TODAY)[TODAY] == pytest.approx(
+            8.0
+        )
 
     def test_wake_time_is_last_record_end(self, customer):
         _sleep_record(
@@ -363,7 +381,9 @@ class TestSleepByDay:
             value="HKCategoryValueSleepAnalysisAsleepUnspecified",
         )
         expected_wake = datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc)
-        assert get_sleep_by_day(customer, TODAY, TODAY)[TODAY].wake_time == expected_wake
+        assert (
+            get_sleep_by_day(customer, TODAY, TODAY)[TODAY].wake_time == expected_wake
+        )
 
     def test_wake_time_capped_at_day_boundary(self, customer):
         # Record ends at 3pm today — after the 2pm boundary; wake_time is capped.
@@ -391,7 +411,9 @@ class TestSleepByDay:
             value="HKCategoryValueSleepAnalysisAsleepUnspecified",
         )
         expected_wake = datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc)
-        assert get_sleep_by_day(customer, TODAY, TODAY)[TODAY].wake_time == expected_wake
+        assert (
+            get_sleep_by_day(customer, TODAY, TODAY)[TODAY].wake_time == expected_wake
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +425,10 @@ class TestHasCompetingSources:
     def test_no_records_returns_false(self, customer):
         start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
         end_dt = start_dt + timedelta(days=1)
-        assert has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt) is False
+        assert (
+            has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt)
+            is False
+        )
 
     def test_same_source_only_returns_false(self, customer):
         start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
@@ -419,7 +444,10 @@ class TestHasCompetingSources:
             creationDate=NOW,
             admin_create_date=NOW,
         )
-        assert has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt) is False
+        assert (
+            has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt)
+            is False
+        )
 
     def test_different_source_returns_true(self, customer):
         start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
@@ -435,7 +463,10 @@ class TestHasCompetingSources:
             creationDate=NOW,
             admin_create_date=NOW,
         )
-        assert has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt) is True
+        assert (
+            has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt)
+            is True
+        )
 
 
 class TestEnsureRanks:
@@ -451,12 +482,18 @@ class TestEnsureRanks:
     def test_idempotent(self, customer):
         ensure_ranks(customer)
         ensure_ranks(customer)
-        assert DataSourceRanking.objects.filter(customer=customer).count() == len(DataSource.values)
+        assert DataSourceRanking.objects.filter(customer=customer).count() == len(
+            DataSource.values
+        )
 
     def test_rebuilds_invalid_ranks(self, customer):
-        DataSourceRanking.objects.create(customer=customer, dataSource=DataSource.APPLE_HEALTH, rank=99)
+        DataSourceRanking.objects.create(
+            customer=customer, dataSource=DataSource.APPLE_HEALTH, rank=99
+        )
         ensure_ranks(customer)
-        ranks = list(DataSourceRanking.objects.filter(customer=customer).order_by("rank"))
+        ranks = list(
+            DataSourceRanking.objects.filter(customer=customer).order_by("rank")
+        )
         assert len(ranks) == len(DataSource.values)
         assert [r.rank for r in ranks] == list(range(1, len(DataSource.values) + 1))
 
@@ -468,7 +505,9 @@ class TestEnsureRanks:
             status="active",
         )
         ensure_ranks(customer)
-        first = DataSourceRanking.objects.filter(customer=customer).order_by("rank").first()
+        first = (
+            DataSourceRanking.objects.filter(customer=customer).order_by("rank").first()
+        )
         assert first is not None
         assert first.dataSource == DataSource.FITBIT
 
@@ -484,7 +523,9 @@ class TestEnsureRanks:
             status="active",
         )
         ensure_ranks(customer)
-        ranks = list(DataSourceRanking.objects.filter(customer=customer).order_by("rank"))
+        ranks = list(
+            DataSourceRanking.objects.filter(customer=customer).order_by("rank")
+        )
         assert ranks[0].dataSource == DataSource.FITBIT
 
     def test_preferred_source_uses_most_recent_active_connection(self, customer):
@@ -507,7 +548,9 @@ class TestEnsureRanks:
             connected_at=later,
         )
         ensure_ranks(customer)
-        first = DataSourceRanking.objects.filter(customer=customer).order_by("rank").first()
+        first = (
+            DataSourceRanking.objects.filter(customer=customer).order_by("rank").first()
+        )
         assert first is not None
         assert first.dataSource == DataSource.FITBIT
 
@@ -520,7 +563,9 @@ class TestEnsureRanks:
 @pytest.mark.skip(reason="requires PostgreSQL; tested via consuming project")
 class TestActivityByDay:
     def test_empty_returns_none(self, customer):
-        result = get_activity_by_day(customer, ActivityMetric.ACTIVE_CALORIES, TODAY, TODAY)
+        result = get_activity_by_day(
+            customer, ActivityMetric.ACTIVE_CALORIES, TODAY, TODAY
+        )
         assert result == {TODAY: None}
 
     def test_single_day_value(self, customer):
@@ -536,7 +581,9 @@ class TestActivityByDay:
         Record.objects.create(
             customer=customer,
             startDate=datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc),
-            endDate=datetime.combine(TODAY + timedelta(days=1), time(0)).replace(tzinfo=timezone.utc),
+            endDate=datetime.combine(TODAY + timedelta(days=1), time(0)).replace(
+                tzinfo=timezone.utc
+            ),
             type=ActivityMetric.ACTIVE_CALORIES.value,
             value="500",
             unit="kcal",
@@ -545,19 +592,31 @@ class TestActivityByDay:
             creationDate=NOW,
             admin_create_date=NOW,
         )
-        result = get_activity_by_day(customer, ActivityMetric.ACTIVE_CALORIES, TODAY, TODAY)
+        result = get_activity_by_day(
+            customer, ActivityMetric.ACTIVE_CALORIES, TODAY, TODAY
+        )
         assert result[TODAY] == pytest.approx(500.0)
 
     def test_multi_day_range(self, customer):
         end = TODAY + timedelta(days=2)
-        result = get_activity_by_day(customer, ActivityMetric.ACTIVE_CALORIES, TODAY, end)
-        assert set(result.keys()) == {TODAY, TODAY + timedelta(days=1), TODAY + timedelta(days=2)}
+        result = get_activity_by_day(
+            customer, ActivityMetric.ACTIVE_CALORIES, TODAY, end
+        )
+        assert set(result.keys()) == {
+            TODAY,
+            TODAY + timedelta(days=1),
+            TODAY + timedelta(days=2),
+        }
         assert all(v is None for v in result.values())
 
     def test_get_activity_records_empty(self, customer):
         start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
-        end_dt = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(tzinfo=timezone.utc)
-        result = get_activity_records(customer, ActivityMetric.ACTIVE_CALORIES, start_dt, end_dt)
+        end_dt = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(
+            tzinfo=timezone.utc
+        )
+        result = get_activity_records(
+            customer, ActivityMetric.ACTIVE_CALORIES, start_dt, end_dt
+        )
         assert result == []
 
     def test_get_activity_records_single(self, customer):
@@ -576,9 +635,15 @@ class TestActivityByDay:
             creationDate=NOW,
             admin_create_date=NOW,
         )
-        window_end = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(tzinfo=timezone.utc)
+        window_end = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(
+            tzinfo=timezone.utc
+        )
         result = get_activity_records(
-            customer, ActivityMetric.ACTIVE_CALORIES, start_dt, window_end, resolution_minutes=15
+            customer,
+            ActivityMetric.ACTIVE_CALORIES,
+            start_dt,
+            window_end,
+            resolution_minutes=15,
         )
         assert len(result) == 1
         assert result[0][0] == start_dt
@@ -601,9 +666,15 @@ class TestActivityByDay:
             creationDate=NOW,
             admin_create_date=NOW,
         )
-        window_end = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(tzinfo=timezone.utc)
+        window_end = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(
+            tzinfo=timezone.utc
+        )
         result = get_activity_records(
-            customer, ActivityMetric.ACTIVE_CALORIES, start_dt, window_end, resolution_minutes=1440
+            customer,
+            ActivityMetric.ACTIVE_CALORIES,
+            start_dt,
+            window_end,
+            resolution_minutes=1440,
         )
         assert len(result) == 1
         assert result[0][2] == pytest.approx(500.0)

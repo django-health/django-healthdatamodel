@@ -37,7 +37,5 @@ def set_customer_device(
     WearableConnection.objects.filter(
         customer=customer,
         status=ConnectionStatus.ACTIVE,
-    ).exclude(
-        pk=conn.pk
-    ).update(status=ConnectionStatus.DISCONNECTED)
+    ).exclude(pk=conn.pk).update(status=ConnectionStatus.DISCONNECTED)
     return conn

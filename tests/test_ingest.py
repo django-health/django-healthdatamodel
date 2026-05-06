@@ -4,6 +4,7 @@ Tests for healthdatamodel.ingest and the in-memory query helper
 
 All tests run against SQLite (:memory:).
 """
+
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
@@ -37,7 +38,13 @@ def customer():
     return User.objects.create_user(username="ingest-test-user")
 
 
-def _record(start: datetime, end: datetime, value: str, unit: str = "kcal", type: str = ActivityMetric.ACTIVE_CALORIES) -> RecordInput:
+def _record(
+    start: datetime,
+    end: datetime,
+    value: str,
+    unit: str = "kcal",
+    type: str = ActivityMetric.ACTIVE_CALORIES,
+) -> RecordInput:
     return RecordInput(
         startDate=start,
         endDate=end,
@@ -235,7 +242,13 @@ class TestIngestCompactActivity:
 
 
 class TestGetActivityByDayFromRecords:
-    def _make_daily_record(self, day: date, value: float, metric: ActivityMetric = ActivityMetric.ACTIVE_CALORIES, unit: str = "kcal") -> RecordInput:
+    def _make_daily_record(
+        self,
+        day: date,
+        value: float,
+        metric: ActivityMetric = ActivityMetric.ACTIVE_CALORIES,
+        unit: str = "kcal",
+    ) -> RecordInput:
         start = datetime.combine(day, datetime.min.time()).replace(tzinfo=timezone.utc)
         return RecordInput(
             startDate=start,
@@ -252,24 +265,32 @@ class TestGetActivityByDayFromRecords:
             self._make_daily_record(MON, 300.0),
             self._make_daily_record(TUE, 250.0),
         ]
-        result = get_activity_by_day_from_records(records, ActivityMetric.ACTIVE_CALORIES, MON, TUE)
+        result = get_activity_by_day_from_records(
+            records, ActivityMetric.ACTIVE_CALORIES, MON, TUE
+        )
         assert result[MON] == pytest.approx(300.0)
         assert result[TUE] == pytest.approx(250.0)
 
     def test_missing_day_returns_none(self):
         records = [self._make_daily_record(MON, 300.0)]
-        result = get_activity_by_day_from_records(records, ActivityMetric.ACTIVE_CALORIES, MON, TUE)
+        result = get_activity_by_day_from_records(
+            records, ActivityMetric.ACTIVE_CALORIES, MON, TUE
+        )
         assert result[MON] == pytest.approx(300.0)
         assert result[TUE] is None
 
     def test_zero_value_returns_zero_not_none(self):
         records = [self._make_daily_record(MON, 0.0)]
-        result = get_activity_by_day_from_records(records, ActivityMetric.ACTIVE_CALORIES, MON, MON)
+        result = get_activity_by_day_from_records(
+            records, ActivityMetric.ACTIVE_CALORIES, MON, MON
+        )
         assert result[MON] == 0.0
 
     def test_cal_unit_converted_to_kcal(self):
         records = [self._make_daily_record(MON, 300_000.0, unit="cal")]
-        result = get_activity_by_day_from_records(records, ActivityMetric.ACTIVE_CALORIES, MON, MON)
+        result = get_activity_by_day_from_records(
+            records, ActivityMetric.ACTIVE_CALORIES, MON, MON
+        )
         assert result[MON] == pytest.approx(300.0)
 
     def test_wrong_metric_excluded(self):
@@ -277,12 +298,16 @@ class TestGetActivityByDayFromRecords:
             self._make_daily_record(MON, 300.0, metric=ActivityMetric.ACTIVE_CALORIES),
             self._make_daily_record(MON, 1000.0, metric=ActivityMetric.STEPS),
         ]
-        result = get_activity_by_day_from_records(records, ActivityMetric.ACTIVE_CALORIES, MON, MON)
+        result = get_activity_by_day_from_records(
+            records, ActivityMetric.ACTIVE_CALORIES, MON, MON
+        )
         assert result[MON] == pytest.approx(300.0)
 
     def test_negative_value_clamped_to_zero(self):
         records = [self._make_daily_record(MON, -50.0)]
-        result = get_activity_by_day_from_records(records, ActivityMetric.ACTIVE_CALORIES, MON, MON)
+        result = get_activity_by_day_from_records(
+            records, ActivityMetric.ACTIVE_CALORIES, MON, MON
+        )
         assert result[MON] == 0.0
 
     def test_sums_15min_records_to_daily(self):
@@ -300,7 +325,9 @@ class TestGetActivityByDayFromRecords:
             )
             for i in range(4)
         ]
-        result = get_activity_by_day_from_records(records, ActivityMetric.ACTIVE_CALORIES, MON, MON)
+        result = get_activity_by_day_from_records(
+            records, ActivityMetric.ACTIVE_CALORIES, MON, MON
+        )
         assert result[MON] == pytest.approx(100.0)
 
 

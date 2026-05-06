@@ -36,6 +36,7 @@ Ranking / source utilities
   exist in a window; useful on the ingest path to decide whether
   source-ranked deduplication is needed.
 """
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -129,10 +130,14 @@ def _preferred_sleep_brand(customer: Any) -> str:
     ).first()
     if conn:
         return conn.device_brand
-    conn = WearableConnection.objects.filter(
-        customer=customer,
-        status=ConnectionStatus.ACTIVE,
-    ).order_by("connected_at").first()
+    conn = (
+        WearableConnection.objects.filter(
+            customer=customer,
+            status=ConnectionStatus.ACTIVE,
+        )
+        .order_by("connected_at")
+        .first()
+    )
     return conn.device_brand if conn else ""
 
 
@@ -146,7 +151,9 @@ def _sleep_for_day(customer: Any, day: date, boundary_hour: int) -> DailySleep:
     ).filter(
         Q(startDate__lt=end_time, startDate__gte=start_time)
         | Q(endDate__gt=start_time, endDate__lte=end_time)
-        | Q(startDate__lt=start_time, endDate__gt=end_time)  # record spans entire window
+        | Q(
+            startDate__lt=start_time, endDate__gt=end_time
+        )  # record spans entire window
     )
 
     most_recent = sleep_qs.order_by("admin_create_date").last()
@@ -162,21 +169,28 @@ def _sleep_for_day(customer: Any, day: date, boundary_hour: int) -> DailySleep:
 
     if len(devices) > 1:
         preferred = _preferred_sleep_brand(customer)
-        sort_order = _DEFAULT_SLEEP_DEVICE_SORT_ORDER + sorted(d.lower() for d in devices)
+        sort_order = _DEFAULT_SLEEP_DEVICE_SORT_ORDER + sorted(
+            d.lower() for d in devices
+        )
         if preferred:
             sort_order = [preferred.lower()] + sort_order
         devices = sorted(
             devices,
-            key=lambda d: sort_order.index(d.lower())
-            if d.lower() in sort_order
-            else len(sort_order),
+            key=lambda d: (
+                sort_order.index(d.lower())
+                if d.lower() in sort_order
+                else len(sort_order)
+            ),
         )
 
-    records_for_device = sleep_qs.filter(admin_create_date=upload_dt, sourceName=devices[0])
+    records_for_device = sleep_qs.filter(
+        admin_create_date=upload_dt, sourceName=devices[0]
+    )
     pairs = {(r.startDate, r.endDate) for r in records_for_device}
     minutes = int(
         sum(
-            (min(end, end_time) - max(start, start_time)).total_seconds() for start, end in pairs
+            (min(end, end_time) - max(start, start_time)).total_seconds()
+            for start, end in pairs
         )
         // 60
     )
@@ -192,10 +206,14 @@ def _active_data_source(customer: Any) -> str:
     ``Customer._active_connection``: when multiple active connections exist,
     the most recently connected one wins, with ``pk`` as a stable tiebreaker.
     """
-    conn = WearableConnection.objects.filter(
-        customer=customer,
-        status=ConnectionStatus.ACTIVE,
-    ).order_by("-connected_at", "-pk").first()
+    conn = (
+        WearableConnection.objects.filter(
+            customer=customer,
+            status=ConnectionStatus.ACTIVE,
+        )
+        .order_by("-connected_at", "-pk")
+        .first()
+    )
     return conn.data_source if conn else ""
 
 
@@ -249,7 +267,9 @@ def ensure_ranks(customer: Any) -> None:
     all existing rows are deleted and rebuilt.
     """
     n_sources = len(DataSource.values)
-    existing = list(DataSourceRanking.objects.filter(customer=customer).order_by("rank"))
+    existing = list(
+        DataSourceRanking.objects.filter(customer=customer).order_by("rank")
+    )
     preferred = _active_data_source(customer)
     valid = (
         len(existing) == n_sources
@@ -351,7 +371,12 @@ def get_sleep_hours_by_day(
         * ``0.0``   — records found but they cover zero minutes of sleep
         * float     — sleep hours (e.g. ``7.5`` for 7 h 30 m)
     """
-    return {day: result.hours for day, result in get_sleep_by_day(customer, start, end, day_boundary_hour).items()}
+    return {
+        day: result.hours
+        for day, result in get_sleep_by_day(
+            customer, start, end, day_boundary_hour
+        ).items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +463,13 @@ def get_activity_records(
             Q(endDate__lte=end),
             Q(type=metric.value),
         )
-        .values("startDate", "endDate", "value_nonneg", "source_rank_rank", "source_update_rank")
+        .values(
+            "startDate",
+            "endDate",
+            "value_nonneg",
+            "source_rank_rank",
+            "source_update_rank",
+        )
         .query.sql_with_params()
     )
 
@@ -496,9 +527,13 @@ def get_activity_by_day(
         * float     — daily total (kcal for calorie metrics, count for steps)
     """
     start_dt = datetime.combine(start, time(0)).replace(tzinfo=timezone.utc)
-    end_dt = datetime.combine(end + timedelta(days=1), time(0)).replace(tzinfo=timezone.utc)
+    end_dt = datetime.combine(end + timedelta(days=1), time(0)).replace(
+        tzinfo=timezone.utc
+    )
 
-    records = get_activity_records(customer, metric, start_dt, end_dt, resolution_minutes=1440)
+    records = get_activity_records(
+        customer, metric, start_dt, end_dt, resolution_minutes=1440
+    )
 
     raw: dict[date, float] = defaultdict(float)
     for start_ts, _end_ts, value in records:

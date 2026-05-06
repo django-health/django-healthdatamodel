@@ -5,6 +5,7 @@ Pydantic models for the healthdatamodel ingest API.
 before passing data to the ingest functions.  The underlying Django models are
 an internal implementation detail — callers never interact with them directly.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone

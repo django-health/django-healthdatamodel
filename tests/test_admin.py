@@ -29,7 +29,9 @@ class TestWearableConnectionAdmin:
 
         admin_instance = WearableConnectionAdmin(WearableConnection, site)
         factory = RequestFactory()
-        request = factory.get("/admin/healthdatamodel/wearableconnection/", {"q": "Default"})
+        request = factory.get(
+            "/admin/healthdatamodel/wearableconnection/", {"q": "Default"}
+        )
 
         queryset = WearableConnection.objects.all()
         filtered_queryset, use_distinct = admin_instance.get_search_results(
@@ -56,5 +58,7 @@ class TestWearableConnectionAdmin:
         assert connection in filtered
 
         request = factory.get("/admin/", {"q": "default@example.com"})
-        filtered, _ = admin_instance.get_search_results(request, queryset, "default@example.com")
+        filtered, _ = admin_instance.get_search_results(
+            request, queryset, "default@example.com"
+        )
         assert connection in filtered

@@ -3,6 +3,7 @@ from django.db import models
 
 from healthdatamodel.constants import ConnectionStatus, DataSource, DeviceBrand
 
+
 class DataSourceRanking(models.Model):
     """
     Store the ranking of data sources for a customer.
@@ -15,7 +16,9 @@ class DataSourceRanking(models.Model):
     """
 
     customer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    dataSource = models.CharField(max_length=100, null=True, blank=True, choices=DataSource.choices)
+    dataSource = models.CharField(
+        max_length=100, null=True, blank=True, choices=DataSource.choices
+    )
     rank = models.IntegerField()
 
     def __str__(self):

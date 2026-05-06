@@ -22,6 +22,7 @@ Entry points
     instead of re-querying the database — useful after single-source ingests
     when no competing sources exist.
 """
+
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
@@ -138,7 +139,9 @@ async def aingest_records(
     if admin_create_date is None:
         admin_create_date = datetime.now(timezone.utc)
     models = [_to_django(customer, r, source, admin_create_date) for r in records]
-    await Record.objects.abulk_create(models, batch_size=batch_size, ignore_conflicts=True)
+    await Record.objects.abulk_create(
+        models, batch_size=batch_size, ignore_conflicts=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -238,12 +241,16 @@ def ingest_compact_activity(
     dict[date, float | None] | None
         Daily totals when ``return_results=True``; ``None`` otherwise.
     """
-    records = expand_compact_activity(metric, start, values_by_source, resolution_minutes, unit)
+    records = expand_compact_activity(
+        metric, start, values_by_source, resolution_minutes, unit
+    )
     ingest_records(customer, records, source, admin_create_date, batch_size)
     if not return_results:
         return None
     n = max((len(v) for v, _ in values_by_source), default=0)
-    end_date = (start + timedelta(minutes=n * resolution_minutes) - timedelta(seconds=1)).date()
+    end_date = (
+        start + timedelta(minutes=n * resolution_minutes) - timedelta(seconds=1)
+    ).date()
     return _day_totals_from_records(records, metric, start.date(), end_date)
 
 
@@ -260,10 +267,14 @@ async def aingest_compact_activity(
     batch_size: int = 1000,
 ) -> dict[date, float | None] | None:
     """Async variant of :func:`ingest_compact_activity`."""
-    records = expand_compact_activity(metric, start, values_by_source, resolution_minutes, unit)
+    records = expand_compact_activity(
+        metric, start, values_by_source, resolution_minutes, unit
+    )
     await aingest_records(customer, records, source, admin_create_date, batch_size)
     if not return_results:
         return None
     n = max((len(v) for v, _ in values_by_source), default=0)
-    end_date = (start + timedelta(minutes=n * resolution_minutes) - timedelta(seconds=1)).date()
+    end_date = (
+        start + timedelta(minutes=n * resolution_minutes) - timedelta(seconds=1)
+    ).date()
     return _day_totals_from_records(records, metric, start.date(), end_date)

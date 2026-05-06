@@ -4,7 +4,12 @@ import pytest
 from django.contrib.auth import get_user_model
 
 from healthdatamodel.constants import DataSource
-from healthdatamodel.models import DataSourceRanking, Record, Workout, WorkoutMetadataEntry
+from healthdatamodel.models import (
+    DataSourceRanking,
+    Record,
+    Workout,
+    WorkoutMetadataEntry,
+)
 
 pytestmark = pytest.mark.django_db
 
