@@ -113,6 +113,14 @@ class Record(models.Model):
     device = models.CharField(null=True, blank=True, max_length=200)
     admin_create_date = models.DateTimeField()
 
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["customer", "type", "startDate"],
+                name="record_customer_type_start_idx",
+            ),
+        ]
+
     def __str__(self):
         return f"{self.customer} {self.type} {self.startDate=} {self.endDate=} {self.creationDate=} {self.admin_create_date=} {self.value=} {self.unit=}"
 
