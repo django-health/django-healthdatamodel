@@ -4,6 +4,7 @@ from django.db import models
 class DataSource(models.TextChoices):
     APPLE_HEALTH = "apple_health", "Apple Health"
     FITBIT = "fitbit", "Fitbit"
+    GARMIN = "garmin", "Garmin"
     GOOGLE_HEALTH = "google_health", "Google Health"
     HEALTH_CONNECT = "health_connect", "Health Connect"
 
