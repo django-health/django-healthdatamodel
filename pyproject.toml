@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "django-healthdatamodel"
-version = "0.7.0"
+version = "0.8.0"
 description = "A Django app providing a unified data model for personal health and activity data."
 readme = "README.md"
 authors = [

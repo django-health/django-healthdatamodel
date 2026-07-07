@@ -8,6 +8,7 @@ class DataSource(models.TextChoices):
     GOOGLE_HEALTH = "google_health", "Google Health"
     HEALTH_CONNECT = "health_connect", "Health Connect"
     OURA = "oura", "Oura"
+    WHOOP = "whoop", "WHOOP"
 
 
 class DeviceBrand(models.TextChoices):
