@@ -165,6 +165,82 @@ class RecordAdmin(ReadonlyMixin):
         return obj.customer.email if obj.customer else "N/A"
 
 
+class DayFilter(DateRangeFilter):
+    title = "Day"
+    parameter_name = "day_range"
+    field_name = "day"
+    is_date_field = True
+
+
+class SleepDayAdmin(ReadonlyMixin):
+    list_display = [
+        "customer_id",
+        "customer_email",
+        "source",
+        "device",
+        "day",
+        "interval_count",
+        "admin_create_date",
+    ]
+    search_fields = [
+        "device",
+        "customer__email",
+    ]
+    search_help_text = "Search by device or customer email"
+    list_filter = ["source", DayFilter]
+    ordering = ["-day"]
+    list_per_page = 25
+    list_select_related = ("customer",)
+    show_full_result_count = False
+    empty_value_display = "—"
+    raw_id_fields = ("customer",)
+
+    @admin.display(description="Customer ID", ordering="customer__id")
+    def customer_id(self, obj):
+        return obj.customer.pk if obj.customer else "N/A"
+
+    @admin.display(description="Customer Email", ordering="customer__email")
+    def customer_email(self, obj):
+        return obj.customer.email if obj.customer else "N/A"
+
+    @admin.display(description="Intervals")
+    def interval_count(self, obj):
+        return len(obj.intervals)
+
+
+class ActivityDayAdmin(ReadonlyMixin):
+    list_display = [
+        "customer_id",
+        "customer_email",
+        "source",
+        "device",
+        "metric",
+        "day",
+        "resolution_minutes",
+        "admin_create_date",
+    ]
+    search_fields = [
+        "device",
+        "customer__email",
+    ]
+    search_help_text = "Search by device or customer email"
+    list_filter = ["source", "metric", "resolution_minutes", DayFilter]
+    ordering = ["-day"]
+    list_per_page = 25
+    list_select_related = ("customer",)
+    show_full_result_count = False
+    empty_value_display = "—"
+    raw_id_fields = ("customer",)
+
+    @admin.display(description="Customer ID", ordering="customer__id")
+    def customer_id(self, obj):
+        return obj.customer.pk if obj.customer else "N/A"
+
+    @admin.display(description="Customer Email", ordering="customer__email")
+    def customer_email(self, obj):
+        return obj.customer.email if obj.customer else "N/A"
+
+
 class DataSourceRankingAdmin(admin.ModelAdmin, ExportCsvMixin):
     list_display = ("customer", "dataSource", "rank")
     search_fields = ["customer__email"]

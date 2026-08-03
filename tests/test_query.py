@@ -1,11 +1,15 @@
 """
 Tests for healthdatamodel.query.
 
-Sleep tests run against SQLite (:memory:) and cover the full contract.
+Every test in this module runs twice — once against the compact read path
+(SleepDay / ActivityDay) and once against the legacy Record path — via the
+autouse ``read_mode`` fixture.  Data is created through ``ingest_records``
+(which dual-writes to both storage formats), so this module doubles as the
+compact/legacy parity suite.
 
-Activity tests require PostgreSQL (the source-ranking CTE uses
-``EXTRACT(epoch FROM ...)::INTEGER``).  They are skipped here; the
-consuming project's pytest suite (which runs against PostgreSQL) covers them.
+The legacy *activity* path requires PostgreSQL (the source-ranking CTE uses
+``EXTRACT(epoch FROM ...)::INTEGER``), so its legacy parametrization is
+skipped on SQLite; the compact path runs on any backend.
 """
 
 from __future__ import annotations
@@ -14,9 +18,17 @@ from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.db import connection
 
 from healthdatamodel.constants import DataSource
-from healthdatamodel.models import DataSourceRanking, Record, WearableConnection
+from healthdatamodel.ingest import ingest_records
+from healthdatamodel.models import (
+    ActivityDay,
+    DataSourceRanking,
+    Record,
+    SleepDay,
+    WearableConnection,
+)
 from healthdatamodel.query import (
     ActivityMetric,
     DailySleep,
@@ -27,10 +39,19 @@ from healthdatamodel.query import (
     get_sleep_hours_by_day,
     has_competing_sources,
 )
+from healthdatamodel.schemas import RecordInput
 
 User = get_user_model()
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(params=["compact", "legacy"], autouse=True)
+def read_mode(request, settings):
+    """Run every test against both the compact and legacy read paths."""
+    settings.HEALTHDATAMODEL_READ_COMPACT = request.param == "compact"
+    return request.param
+
 
 # ---------------------------------------------------------------------------
 # Shared constants
@@ -66,17 +87,57 @@ def _sleep_record(
     sourceName: str = "apple",
     admin_create_date: datetime = NOW,
 ):
-    return Record.objects.create(
-        customer=customer,
-        startDate=start,
-        endDate=end,
-        type="HKCategoryTypeIdentifierSleepAnalysis",
-        value=value,
+    ingest_records(
+        customer,
+        [
+            RecordInput(
+                startDate=start,
+                endDate=end,
+                creationDate=NOW,
+                sourceName=sourceName,
+                value=value,
+                type="HKCategoryTypeIdentifierSleepAnalysis",
+            )
+        ],
         source=DataSource.APPLE_HEALTH,
-        sourceName=sourceName,
-        creationDate=NOW,
         admin_create_date=admin_create_date,
     )
+
+
+def _activity_record(
+    customer,
+    start: datetime,
+    end: datetime,
+    value: str,
+    source: str = DataSource.APPLE_HEALTH,
+    sourceName: str = "apple",
+    unit: str = "kcal",
+    metric: ActivityMetric = ActivityMetric.ACTIVE_CALORIES,
+    admin_create_date: datetime = NOW,
+):
+    ingest_records(
+        customer,
+        [
+            RecordInput(
+                startDate=start,
+                endDate=end,
+                creationDate=NOW,
+                sourceName=sourceName,
+                value=value,
+                unit=unit,
+                type=metric.value,
+            )
+        ],
+        source=source,
+        admin_create_date=admin_create_date,
+    )
+
+
+def _clear_health_data(customer):
+    """Delete both storage formats between loop iterations of a test."""
+    Record.objects.filter(customer=customer).delete()
+    SleepDay.objects.filter(customer=customer).delete()
+    ActivityDay.objects.filter(customer=customer).delete()
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +188,7 @@ class TestSleepHoursNoData:
             )
             result = get_sleep_hours_by_day(customer, TODAY, TODAY)
             assert result[TODAY] is None, f"expected None for {non_sleep_value}"
-            Record.objects.filter(customer=customer).delete()
+            _clear_health_data(customer)
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +263,7 @@ class TestSleepHoursBasic:
             )
             result = get_sleep_hours_by_day(customer, TODAY, TODAY)
             assert result[TODAY] == pytest.approx(8.0), f"failed for {subtype}"
-            Record.objects.filter(customer=customer).delete()
+            _clear_health_data(customer)
 
     def test_record_crossing_day_boundary_clipped(self, customer):
         # Record spans the entire window: 1pm yesterday → 3pm today.
@@ -433,17 +494,7 @@ class TestHasCompetingSources:
     def test_same_source_only_returns_false(self, customer):
         start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
         end_dt = start_dt + timedelta(days=1)
-        Record.objects.create(
-            customer=customer,
-            startDate=start_dt,
-            endDate=end_dt,
-            type=ActivityMetric.ACTIVE_CALORIES.value,
-            value="300",
-            source=DataSource.APPLE_HEALTH,
-            sourceName="apple",
-            creationDate=NOW,
-            admin_create_date=NOW,
-        )
+        _activity_record(customer, start_dt, end_dt, "300")
         assert (
             has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt)
             is False
@@ -452,15 +503,39 @@ class TestHasCompetingSources:
     def test_different_source_returns_true(self, customer):
         start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
         end_dt = start_dt + timedelta(days=1)
-        Record.objects.create(
-            customer=customer,
-            startDate=start_dt,
-            endDate=end_dt,
-            type=ActivityMetric.ACTIVE_CALORIES.value,
-            value="300",
+        _activity_record(
+            customer,
+            start_dt,
+            end_dt,
+            "300",
             source=DataSource.FITBIT,
             sourceName="fitbit",
-            creationDate=NOW,
+        )
+        assert (
+            has_competing_sources(customer, DataSource.APPLE_HEALTH, start_dt, end_dt)
+            is True
+        )
+
+    def test_sleep_from_other_source_counts(self, customer):
+        start_dt = datetime.combine(YESTERDAY, time(14)).replace(tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(days=1)
+        ingest_records(
+            customer,
+            [
+                RecordInput(
+                    startDate=datetime.combine(YESTERDAY, time(23)).replace(
+                        tzinfo=timezone.utc
+                    ),
+                    endDate=datetime.combine(TODAY, time(7)).replace(
+                        tzinfo=timezone.utc
+                    ),
+                    creationDate=NOW,
+                    sourceName="fitbit",
+                    value="HKCategoryValueSleepAnalysisAsleepUnspecified",
+                    type="HKCategoryTypeIdentifierSleepAnalysis",
+                )
+            ],
+            source=DataSource.FITBIT,
             admin_create_date=NOW,
         )
         assert (
@@ -556,12 +631,16 @@ class TestEnsureRanks:
 
 
 # ---------------------------------------------------------------------------
-# get_activity_by_day / get_activity_records — skipped (requires PostgreSQL)
+# get_activity_by_day / get_activity_records
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="requires PostgreSQL; tested via consuming project")
 class TestActivityByDay:
+    @pytest.fixture(autouse=True)
+    def _legacy_requires_postgresql(self, read_mode):
+        if read_mode == "legacy" and connection.vendor != "postgresql":
+            pytest.skip("legacy activity path requires PostgreSQL")
+
     def test_empty_returns_none(self, customer):
         result = get_activity_by_day(
             customer, ActivityMetric.ACTIVE_CALORIES, TODAY, TODAY
@@ -569,33 +648,116 @@ class TestActivityByDay:
         assert result == {TODAY: None}
 
     def test_single_day_value(self, customer):
-        DataSourceRanking.objects.create(
-            customer=customer, dataSource=DataSource.APPLE_HEALTH, rank=1
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        _activity_record(customer, start_dt, start_dt + timedelta(days=1), "500")
+        result = get_activity_by_day(
+            customer, ActivityMetric.ACTIVE_CALORIES, TODAY, TODAY
         )
-        DataSourceRanking.objects.create(
-            customer=customer, dataSource=DataSource.FITBIT, rank=2
-        )
-        DataSourceRanking.objects.create(
-            customer=customer, dataSource=DataSource.HEALTH_CONNECT, rank=3
-        )
-        Record.objects.create(
-            customer=customer,
-            startDate=datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc),
-            endDate=datetime.combine(TODAY + timedelta(days=1), time(0)).replace(
-                tzinfo=timezone.utc
-            ),
-            type=ActivityMetric.ACTIVE_CALORIES.value,
-            value="500",
-            unit="kcal",
-            source=DataSource.APPLE_HEALTH,
-            sourceName="apple",
-            creationDate=NOW,
-            admin_create_date=NOW,
+        assert result[TODAY] == pytest.approx(500.0)
+
+    def test_cal_unit_converted_to_kcal(self, customer):
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        _activity_record(
+            customer, start_dt, start_dt + timedelta(days=1), "500000", unit="cal"
         )
         result = get_activity_by_day(
             customer, ActivityMetric.ACTIVE_CALORIES, TODAY, TODAY
         )
         assert result[TODAY] == pytest.approx(500.0)
+
+    def test_source_ranked_dedup_picks_best_source(self, customer):
+        # apple_health outranks fitbit in the default order → 500 wins
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(days=1)
+        _activity_record(customer, start_dt, end_dt, "500")
+        _activity_record(
+            customer,
+            start_dt,
+            end_dt,
+            "900",
+            source=DataSource.FITBIT,
+            sourceName="fitbit",
+        )
+        result = get_activity_by_day(
+            customer, ActivityMetric.ACTIVE_CALORIES, TODAY, TODAY
+        )
+        assert result[TODAY] == pytest.approx(500.0)
+
+    def test_per_slot_dedup_between_sources(self, customer):
+        # apple covers slot 0 only; fitbit covers slots 0 and 1.  Slot 0 goes
+        # to the better-ranked apple, slot 1 falls through to fitbit.
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        _activity_record(customer, start_dt, start_dt + timedelta(minutes=15), "10")
+        _activity_record(
+            customer,
+            start_dt,
+            start_dt + timedelta(minutes=15),
+            "5",
+            source=DataSource.FITBIT,
+            sourceName="fitbit",
+        )
+        _activity_record(
+            customer,
+            start_dt + timedelta(minutes=15),
+            start_dt + timedelta(minutes=30),
+            "5",
+            source=DataSource.FITBIT,
+            sourceName="fitbit",
+        )
+        result = get_activity_records(
+            customer,
+            ActivityMetric.ACTIVE_CALORIES,
+            start_dt,
+            start_dt + timedelta(days=1),
+            resolution_minutes=15,
+        )
+        assert [(r[0], r[2]) for r in result] == [
+            (start_dt, pytest.approx(10.0)),
+            (start_dt + timedelta(minutes=15), pytest.approx(5.0)),
+        ]
+
+    def test_devices_within_source_summed(self, customer):
+        # Two devices in the same source at the same interval tie on rank and
+        # are both counted (legacy Rank() tie behaviour).
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        _activity_record(customer, start_dt, start_dt + timedelta(minutes=15), "100")
+        _activity_record(
+            customer,
+            start_dt,
+            start_dt + timedelta(minutes=15),
+            "50",
+            sourceName="iphone",
+        )
+        result = get_activity_records(
+            customer,
+            ActivityMetric.ACTIVE_CALORIES,
+            start_dt,
+            start_dt + timedelta(days=1),
+            resolution_minutes=15,
+        )
+        assert len(result) == 1
+        assert result[0][2] == pytest.approx(150.0)
+
+    def test_latest_upload_wins_per_interval(self, customer):
+        start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
+        end_dt = start_dt + timedelta(minutes=15)
+        _activity_record(
+            customer,
+            start_dt,
+            end_dt,
+            "100",
+            admin_create_date=NOW - timedelta(hours=2),
+        )
+        _activity_record(customer, start_dt, end_dt, "80", admin_create_date=NOW)
+        result = get_activity_records(
+            customer,
+            ActivityMetric.ACTIVE_CALORIES,
+            start_dt,
+            start_dt + timedelta(days=1),
+            resolution_minutes=15,
+        )
+        assert len(result) == 1
+        assert result[0][2] == pytest.approx(80.0)
 
     def test_multi_day_range(self, customer):
         end = TODAY + timedelta(days=2)
@@ -623,18 +785,7 @@ class TestActivityByDay:
         start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
         end_dt = start_dt + timedelta(minutes=15)
         ensure_ranks(customer)
-        Record.objects.create(
-            customer=customer,
-            startDate=start_dt,
-            endDate=end_dt,
-            type=ActivityMetric.ACTIVE_CALORIES.value,
-            value="300",
-            unit="kcal",
-            source=DataSource.APPLE_HEALTH,
-            sourceName="apple",
-            creationDate=NOW,
-            admin_create_date=NOW,
-        )
+        _activity_record(customer, start_dt, end_dt, "300")
         window_end = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(
             tzinfo=timezone.utc
         )
@@ -654,18 +805,7 @@ class TestActivityByDay:
         start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
         end_dt = start_dt + timedelta(days=1)
         ensure_ranks(customer)
-        Record.objects.create(
-            customer=customer,
-            startDate=start_dt,
-            endDate=end_dt,
-            type=ActivityMetric.ACTIVE_CALORIES.value,
-            value="500",
-            unit="kcal",
-            source=DataSource.APPLE_HEALTH,
-            sourceName="apple",
-            creationDate=NOW,
-            admin_create_date=NOW,
-        )
+        _activity_record(customer, start_dt, end_dt, "500")
         window_end = datetime.combine(TODAY + timedelta(days=1), time(0)).replace(
             tzinfo=timezone.utc
         )

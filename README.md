@@ -7,9 +7,18 @@ A reusable Django app for storing and querying health data in a schema inspired 
 
 ## Models
 
+### SleepDay / ActivityDay — compact storage (v1.0)
+
+The primary storage format since v1.0. One row per key, no duplicates:
+
+- **`SleepDay`** — one night of sleep per `(customer, device, day)`, where `day` is the 2 pm–2 pm UTC sleep window. Intervals (with sleep stage) live in a JSON list on the row. A new upload for that user–device **replaces** the day.
+- **`ActivityDay`** — one day of one metric per `(customer, source, device, metric, day, resolution)`, holding a vector of slot values (96 slots at 15-minute resolution; 1 slot at daily). New uploads **merge slot-wise**: incoming slots overwrite, untouched slots keep their value. `None` slots mean "no data", preserving the None-vs-0.0 distinction in the query API.
+
+Values are normalised at write time (kcal, non-negative, steps as int, energy rounded to 0.1 kcal), so reads are straight sums. Compared to the `Record` log this is roughly a 100× reduction in rows written, and it removes the PostgreSQL requirement from the activity query path.
+
 ### Record
 
-Stores individual health measurements. Each record has a `type` (e.g. `HKQuantityTypeIdentifierActiveEnergyBurned`), a `value`, a `unit`, and a `startDate`/`endDate` range. Records are associated with a user via `settings.AUTH_USER_MODEL`.
+Stores individual health measurements in the original append-only log format. Each record has a `type` (e.g. `HKQuantityTypeIdentifierActiveEnergyBurned`), a `value`, a `unit`, and a `startDate`/`endDate` range. Records are associated with a user via `settings.AUTH_USER_MODEL`. Since v1.0 this is an optional write-through log (see `HEALTHDATAMODEL_SAVE_RECORDS` below).
 
 ### Workout
 
@@ -100,7 +109,7 @@ The day boundary defaults to **14:00 UTC** (2 pm), giving a window of 2 pm the p
 
 Device preference is read from `WearableConnection`. When multiple sleep sources are present, the `preferred_for_sleep` device wins; the default fallback order is `oura → whoop → apple → garmin`.
 
-Sleep functions work with any Django-supported backend (SQLite, PostgreSQL, etc.).
+Sleep functions work with any Django-supported backend (SQLite, PostgreSQL, etc.). The compact tables store sleep at the canonical 2 pm boundary but the stored interval pieces tile the original records exactly, so any `day_boundary_hour` is still served correctly.
 
 ### Activity
 
@@ -121,7 +130,7 @@ records = get_activity_records(customer, ActivityMetric.STEPS, start, end, resol
 
 `get_activity_by_day` is a convenience wrapper around `get_activity_records(resolution_minutes=1440)`.
 
-Both require **PostgreSQL** (window-function CTEs for source-ranked deduplication).
+With the default compact read path these work on **any backend**. The legacy read path (`HEALTHDATAMODEL_READ_COMPACT = False`) requires **PostgreSQL** (window-function CTEs for source-ranked deduplication).
 
 ### Ranking and source utilities
 
@@ -226,9 +235,45 @@ totals = get_activity_by_day_from_records(records, metric, start_date, end_date)
 # dict[date, float | None] — no database query
 ```
 
+## Compact storage settings & migration (v1.0)
+
+Upgrading from 0.x: run `python manage.py migrate`. Migration `0010` seeds the
+compact tables from your existing `Record` rows automatically. For large
+installs, set `HEALTHDATAMODEL_SKIP_BACKFILL_MIGRATION = True` first and run
+the batched, idempotent management command instead:
+
+```
+python manage.py backfill_compact [--customers 1 2 3] [--since 2026-01-01]
+```
+
+All settings are optional:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `HEALTHDATAMODEL_SAVE_RECORDS` | `True` | Write-through to the legacy `Record` log. Per-call override: `ingest_records(..., save_records=False)`. |
+| `HEALTHDATAMODEL_SAVE_COMPACT` | `True` | Escape hatch to stage the upgrade (disables compact writes). |
+| `HEALTHDATAMODEL_READ_COMPACT` | `True` | Instant rollback lever: `False` restores the legacy read path (requires the `Record` data to still be there, and PostgreSQL for activity). |
+| `HEALTHDATAMODEL_SKIP_BACKFILL_MIGRATION` | `False` | Skip the in-migration backfill; run `backfill_compact` yourself. |
+
+Records the compact schema cannot represent (unknown HK types, intervals not
+aligned to a day-dividing grid) are written to `Record` even when
+`save_records` is off — nothing is silently dropped.
+
+Before turning `Record` writes off, verify parity on your data:
+
+```
+python manage.py verify_compact --sample 50 --days 30
+```
+
+It runs the query API in both read modes and diffs the results (exit code 1
+on mismatch). The intended rollout: upgrade & migrate → dual-write while
+validating → set `HEALTHDATAMODEL_SAVE_RECORDS = False` (this will be the
+default in a future release) → let your `Record` retention/archive policy
+drain the log.
+
 ## Admin
 
-Admin classes (`WorkoutAdmin`, `RecordAdmin`, `WearableConnectionAdmin`, etc.) are defined in `healthdatamodel.admin` but **not registered** — registration is left to the host project:
+Admin classes (`WorkoutAdmin`, `RecordAdmin`, `SleepDayAdmin`, `ActivityDayAdmin`, `WearableConnectionAdmin`, etc.) are defined in `healthdatamodel.admin` but **not registered** — registration is left to the host project:
 
 ```python
 from django.contrib import admin
