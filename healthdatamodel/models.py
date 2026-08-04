@@ -1,7 +1,15 @@
+from datetime import datetime, timezone
+
 from django.conf import settings
 from django.db import models
 
-from healthdatamodel.constants import ConnectionStatus, DataSource, DeviceBrand
+from healthdatamodel.constants import (
+    AGGREGATOR_SOURCES,
+    SOURCE_IMPLIED_BRAND,
+    ConnectionStatus,
+    DataSource,
+    DeviceBrand,
+)
 
 
 class DataSourceRanking(models.Model):
@@ -188,6 +196,72 @@ class WearableConnection(models.Model):
     @property
     def is_active(self) -> bool:
         return self.status == ConnectionStatus.ACTIVE
+
+    @classmethod
+    def active_for(cls, customer) -> "WearableConnection | None":
+        """The customer's primary connection: most recently connected active row."""
+        return (
+            cls.objects.filter(customer=customer, status=ConnectionStatus.ACTIVE)
+            .order_by("-connected_at", "-pk")
+            .first()
+        )
+
+    @classmethod
+    def activate(
+        cls, customer, data_source: str, device_brand: str = ""
+    ) -> "WearableConnection":
+        """Make ``data_source`` the customer's single active connection.
+
+        Brand resolution, in order: an explicit ``device_brand`` argument;
+        the brand implied by a direct-device source; the brand already on the
+        row being reactivated; for aggregator sources, the brand carried
+        forward from the outgoing active connection.  The carry-forward is
+        what keeps a Garmin user's brand across e.g. an apple_health →
+        google_health switch without callers mirroring it onto both rows.
+        """
+        outgoing = cls.active_for(customer)
+        conn, _created = cls.objects.update_or_create(
+            customer=customer,
+            data_source=data_source,
+            defaults={"status": ConnectionStatus.ACTIVE, "disconnected_at": None},
+        )
+        brand = (
+            device_brand
+            or SOURCE_IMPLIED_BRAND.get(data_source, "")
+            or conn.device_brand
+        )
+        if (
+            not brand
+            and data_source in AGGREGATOR_SOURCES
+            and outgoing is not None
+            and outgoing.pk != conn.pk
+        ):
+            brand = outgoing.device_brand
+        if brand != conn.device_brand:
+            conn.device_brand = brand
+            conn.save(update_fields=["device_brand"])
+        cls.objects.filter(customer=customer, status=ConnectionStatus.ACTIVE).exclude(
+            pk=conn.pk
+        ).update(
+            status=ConnectionStatus.DISCONNECTED,
+            disconnected_at=datetime.now(timezone.utc),
+        )
+        return conn
+
+    @classmethod
+    def set_brand(cls, customer, device_brand: str) -> "WearableConnection | None":
+        """Record the physical device brand on the customer's active connection.
+
+        Returns the updated connection, or None when the customer has no
+        active connection yet (callers decide whether to ``activate`` first).
+        """
+        conn = cls.active_for(customer)
+        if conn is None:
+            return None
+        if conn.device_brand != device_brand:
+            conn.device_brand = device_brand
+            conn.save(update_fields=["device_brand"])
+        return conn
 
 
 # Need to keep these arround for the old migrations

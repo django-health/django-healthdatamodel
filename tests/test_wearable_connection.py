@@ -159,6 +159,124 @@ class TestPreferredForSleep:
         assert preferred.first().data_source == DataSource.APPLE_HEALTH
 
 
+class TestActiveFor:
+    def test_none_when_no_connections(self, user):
+        assert WearableConnection.active_for(user) is None
+
+    def test_none_when_all_disconnected(self, user):
+        WearableConnection.objects.create(
+            customer=user,
+            data_source=DataSource.FITBIT,
+            status=ConnectionStatus.DISCONNECTED,
+        )
+        assert WearableConnection.active_for(user) is None
+
+    def test_most_recently_connected_active_wins(self, user):
+        older = WearableConnection.objects.create(
+            customer=user, data_source=DataSource.FITBIT
+        )
+        newer = WearableConnection.objects.create(
+            customer=user, data_source=DataSource.APPLE_HEALTH
+        )
+        # auto_now_add stamps both in the same test transaction; force ordering
+        WearableConnection.objects.filter(pk=older.pk).update(
+            connected_at=datetime(2026, 1, 1, tzinfo=timezone.utc)
+        )
+        WearableConnection.objects.filter(pk=newer.pk).update(
+            connected_at=datetime(2026, 2, 1, tzinfo=timezone.utc)
+        )
+        assert WearableConnection.active_for(user).pk == newer.pk
+
+
+class TestActivate:
+    def test_creates_active_row(self, user):
+        conn = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+        assert conn.status == ConnectionStatus.ACTIVE
+        assert conn.device_brand == ""
+
+    def test_explicit_brand_wins(self, user):
+        conn = WearableConnection.activate(
+            user, DataSource.APPLE_HEALTH, device_brand=DeviceBrand.GARMIN
+        )
+        assert conn.device_brand == DeviceBrand.GARMIN
+
+    def test_direct_source_implies_brand(self, user):
+        conn = WearableConnection.activate(user, DataSource.FITBIT)
+        assert conn.device_brand == DeviceBrand.FITBIT
+
+    def test_deactivates_other_connections(self, user):
+        WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+        WearableConnection.activate(user, DataSource.FITBIT)
+        active = WearableConnection.objects.filter(
+            customer=user, status=ConnectionStatus.ACTIVE
+        )
+        assert active.count() == 1
+        assert active.first().data_source == DataSource.FITBIT
+        disconnected = WearableConnection.objects.get(
+            customer=user, data_source=DataSource.APPLE_HEALTH
+        )
+        assert disconnected.status == ConnectionStatus.DISCONNECTED
+        assert disconnected.disconnected_at is not None
+
+    def test_reactivate_clears_disconnected_at_and_keeps_brand(self, user):
+        WearableConnection.activate(
+            user, DataSource.APPLE_HEALTH, device_brand=DeviceBrand.OURA
+        )
+        WearableConnection.activate(user, DataSource.FITBIT)
+        conn = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+        assert conn.status == ConnectionStatus.ACTIVE
+        assert conn.disconnected_at is None
+        assert conn.device_brand == DeviceBrand.OURA
+
+    def test_aggregator_inherits_brand_from_outgoing(self, user):
+        """A Garmin user switching apple_health → google_health keeps their brand."""
+        WearableConnection.activate(
+            user, DataSource.APPLE_HEALTH, device_brand=DeviceBrand.GARMIN
+        )
+        conn = WearableConnection.activate(user, DataSource.GOOGLE_HEALTH)
+        assert conn.device_brand == DeviceBrand.GARMIN
+
+    def test_direct_source_does_not_inherit(self, user):
+        WearableConnection.activate(
+            user, DataSource.HEALTH_CONNECT, device_brand=DeviceBrand.SAMSUNG
+        )
+        conn = WearableConnection.activate(user, DataSource.FITBIT)
+        assert conn.device_brand == DeviceBrand.FITBIT
+
+    def test_idempotent_on_same_source(self, user):
+        first = WearableConnection.activate(
+            user, DataSource.APPLE_HEALTH, device_brand=DeviceBrand.APPLE
+        )
+        again = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+        assert again.pk == first.pk
+        assert again.device_brand == DeviceBrand.APPLE
+        assert (
+            WearableConnection.objects.filter(
+                customer=user, status=ConnectionStatus.ACTIVE
+            ).count()
+            == 1
+        )
+
+
+class TestSetBrand:
+    def test_writes_to_active_connection(self, user):
+        WearableConnection.activate(user, DataSource.GOOGLE_HEALTH)
+        conn = WearableConnection.set_brand(user, DeviceBrand.FITBIT)
+        assert conn is not None
+        assert conn.data_source == DataSource.GOOGLE_HEALTH
+        assert conn.device_brand == DeviceBrand.FITBIT
+
+    def test_none_without_active_connection(self, user):
+        assert WearableConnection.set_brand(user, DeviceBrand.APPLE) is None
+
+    def test_brand_set_then_survives_source_switch(self, user):
+        """The #2105 scenario: brand picked while on google_health survives switching off it."""
+        WearableConnection.activate(user, DataSource.GOOGLE_HEALTH)
+        WearableConnection.set_brand(user, DeviceBrand.GARMIN)
+        conn = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+        assert conn.device_brand == DeviceBrand.GARMIN
+
+
 class TestDeviceBrandConstants:
     def test_device_brands(self):
         assert DeviceBrand.APPLE == "apple"
