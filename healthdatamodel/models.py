@@ -1,7 +1,12 @@
 from django.conf import settings
 from django.db import models
 
-from healthdatamodel.constants import ConnectionStatus, DataSource, DeviceBrand
+from healthdatamodel.constants import (
+    CompactMetric,
+    ConnectionStatus,
+    DataSource,
+    DeviceBrand,
+)
 
 
 class DataSourceRanking(models.Model):
@@ -123,6 +128,94 @@ class Record(models.Model):
 
     def __str__(self):
         return f"{self.customer} {self.type} {self.startDate=} {self.endDate=} {self.creationDate=} {self.admin_create_date=} {self.value=} {self.unit=}"
+
+
+class SleepDay(models.Model):
+    """One night of sleep for one (customer, device) — compact storage.
+
+    ``day`` identifies the sleep-day window
+    ``(day - 1 @ 14:00 UTC, day @ 14:00 UTC]`` (see
+    ``constants.SLEEP_DAY_BOUNDARY_HOUR``).  ``intervals`` holds
+    ``[[start_iso, end_iso, stage], ...]`` entries clipped to that window;
+    an interval spanning the boundary is split across two rows at ingest.
+
+    Replace-on-write: an upload that contains sleep for this
+    (customer, device, day) fully replaces the row — the stored equivalent
+    of the legacy query's "latest ``admin_create_date`` upload wins".
+    All stages are kept (including awake / in-bed); the query layer filters
+    to asleep stages.
+    """
+
+    customer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    source = models.CharField(max_length=100, choices=DataSource.choices)
+    # Matches Record.sourceName — the device axis used for sleep selection.
+    device = models.CharField(max_length=200)
+    day = models.DateField()
+    intervals = models.JSONField(default=list)
+    admin_create_date = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["customer", "device", "day"],
+                name="unique_sleepday_customer_device_day",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["customer", "day"], name="sleepday_customer_day_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.customer} {self.device} {self.day} ({len(self.intervals)} intervals)"
+
+
+class ActivityDay(models.Model):
+    """One day of one metric from one (source, device) — compact storage.
+
+    ``values`` has length ``1440 // resolution_minutes``.  Entries are float
+    (or int for steps) or ``None``; ``None`` means "no data for this slot",
+    preserving the None-vs-0.0 distinction the query API exposes.
+
+    Slot-merge-on-write: incoming non-None slots overwrite stored slots —
+    the per-slot equivalent of the legacy query's "latest
+    ``admin_create_date`` wins per interval".  Values are normalised at
+    write time (kcal, non-negative, steps as int, energy rounded to 0.1).
+    """
+
+    customer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    source = models.CharField(max_length=100, choices=DataSource.choices)
+    # Matches Record.sourceName.  Devices within a source are summed at read
+    # time (mirroring the legacy rank-tie behaviour).
+    device = models.CharField(max_length=200, default="")
+    metric = models.CharField(max_length=20, choices=CompactMetric.choices)
+    day = models.DateField()  # UTC calendar day
+    resolution_minutes = models.PositiveSmallIntegerField()
+    values = models.JSONField()
+    admin_create_date = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    "customer",
+                    "source",
+                    "device",
+                    "metric",
+                    "day",
+                    "resolution_minutes",
+                ],
+                name="unique_activityday_key",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["customer", "metric", "day"],
+                name="activityday_cust_metric_day_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.customer} {self.source}/{self.device} {self.metric} {self.day} @{self.resolution_minutes}min"
 
 
 class WearableConnection(models.Model):

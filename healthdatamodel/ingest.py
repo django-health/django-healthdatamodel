@@ -21,16 +21,34 @@ Entry points
     Pass ``return_results=True`` to get daily totals computed in memory
     instead of re-querying the database — useful after single-source ingests
     when no competing sources exist.
+
+Compact storage (v1.0)
+----------------------
+All ingest functions also write to the compact tables
+(:class:`~healthdatamodel.models.SleepDay` /
+:class:`~healthdatamodel.models.ActivityDay`) unless
+``settings.HEALTHDATAMODEL_SAVE_COMPACT`` is ``False``.  The legacy
+``Record`` write-through is controlled by the ``save_records`` argument,
+defaulting to ``settings.HEALTHDATAMODEL_SAVE_RECORDS`` (``True``).
+Records the compact schema cannot represent (unknown types, non-grid
+intervals) are written to ``Record`` even when ``save_records`` is off, so
+nothing is ever silently dropped.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from asgiref.sync import sync_to_async
+
+from healthdatamodel import compact
 from healthdatamodel.models import Record, Workout, WorkoutMetadataEntry
 from healthdatamodel.query import ActivityMetric
 from healthdatamodel.schemas import RecordInput, WorkoutInput
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -98,14 +116,48 @@ def _day_totals_from_records(
 # ---------------------------------------------------------------------------
 
 
+def _records_to_persist(
+    records: list[RecordInput],
+    leftovers: list[RecordInput],
+    save_records: bool,
+    source: str,
+) -> list[RecordInput]:
+    """Pick which records go to the legacy ``Record`` table.
+
+    With ``save_records`` on, everything is written through (unchanged legacy
+    behaviour).  With it off, only uncompactable leftovers are persisted —
+    with a warning, since the caller presumably expected everything to land
+    in the compact tables.
+    """
+    if save_records:
+        return records
+    if leftovers:
+        logger.warning(
+            "healthdatamodel: %d of %d records from source %s could not be "
+            "stored compactly and were written to Record despite "
+            "save_records=False (types: %s)",
+            len(leftovers),
+            len(records),
+            source,
+            sorted({r.type for r in leftovers}),
+        )
+    return leftovers
+
+
 def ingest_records(
     customer: Any,
     records: list[RecordInput],
     source: str,
     admin_create_date: datetime | None = None,
     batch_size: int = 1000,
+    save_records: bool | None = None,
 ) -> None:
     """Save *records* to the database.
+
+    Records are written to the compact tables
+    (:class:`~healthdatamodel.models.SleepDay` /
+    :class:`~healthdatamodel.models.ActivityDay`) and, depending on
+    *save_records*, to the legacy ``Record`` table.
 
     Parameters
     ----------
@@ -121,10 +173,22 @@ def ingest_records(
         Upload timestamp written to all rows.  Defaults to ``now()``.
     batch_size:
         Rows per ``INSERT`` statement.
+    save_records:
+        Write through to the legacy ``Record`` table.  ``None`` (default)
+        falls back to ``settings.HEALTHDATAMODEL_SAVE_RECORDS`` (``True``).
+        Uncompactable records are written to ``Record`` regardless.
     """
     if admin_create_date is None:
         admin_create_date = datetime.now(timezone.utc)
-    models = [_to_django(customer, r, source, admin_create_date) for r in records]
+    if save_records is None:
+        save_records = compact.save_records_enabled()
+
+    leftovers = list(records)
+    if compact.save_compact_enabled():
+        leftovers = compact.apply_compact(customer, records, source, admin_create_date)
+
+    to_persist = _records_to_persist(records, leftovers, save_records, source)
+    models = [_to_django(customer, r, source, admin_create_date) for r in to_persist]
     Record.objects.bulk_create(models, batch_size=batch_size, ignore_conflicts=True)
 
 
@@ -134,11 +198,27 @@ async def aingest_records(
     source: str,
     admin_create_date: datetime | None = None,
     batch_size: int = 1000,
+    save_records: bool | None = None,
 ) -> None:
-    """Async variant of :func:`ingest_records` using ``abulk_create``."""
+    """Async variant of :func:`ingest_records` using ``abulk_create``.
+
+    The compact write runs in a thread via ``sync_to_async`` (it needs
+    ``transaction.atomic`` + row locking, which the async ORM doesn't
+    support yet).
+    """
     if admin_create_date is None:
         admin_create_date = datetime.now(timezone.utc)
-    models = [_to_django(customer, r, source, admin_create_date) for r in records]
+    if save_records is None:
+        save_records = compact.save_records_enabled()
+
+    leftovers = list(records)
+    if compact.save_compact_enabled():
+        leftovers = await sync_to_async(compact.apply_compact)(
+            customer, records, source, admin_create_date
+        )
+
+    to_persist = _records_to_persist(records, leftovers, save_records, source)
+    models = [_to_django(customer, r, source, admin_create_date) for r in to_persist]
     await Record.objects.abulk_create(
         models, batch_size=batch_size, ignore_conflicts=True
     )
@@ -328,6 +408,7 @@ def ingest_compact_activity(
     return_results: bool = False,
     admin_create_date: datetime | None = None,
     batch_size: int = 1000,
+    save_records: bool | None = None,
 ) -> dict[date, float | None] | None:
     """Expand and save compact activity arrays, optionally returning daily totals.
 
@@ -356,6 +437,9 @@ def ingest_compact_activity(
         Upload timestamp for all rows.  Defaults to ``now()``.
     batch_size:
         Rows per ``INSERT`` statement.
+    save_records:
+        Write through to the legacy ``Record`` table.  ``None`` (default)
+        falls back to ``settings.HEALTHDATAMODEL_SAVE_RECORDS`` (``True``).
 
     Returns
     -------
@@ -365,7 +449,9 @@ def ingest_compact_activity(
     records = expand_compact_activity(
         metric, start, values_by_source, resolution_minutes, unit
     )
-    ingest_records(customer, records, source, admin_create_date, batch_size)
+    ingest_records(
+        customer, records, source, admin_create_date, batch_size, save_records
+    )
     if not return_results:
         return None
     n = max((len(v) for v, _ in values_by_source), default=0)
@@ -386,12 +472,15 @@ async def aingest_compact_activity(
     return_results: bool = False,
     admin_create_date: datetime | None = None,
     batch_size: int = 1000,
+    save_records: bool | None = None,
 ) -> dict[date, float | None] | None:
     """Async variant of :func:`ingest_compact_activity`."""
     records = expand_compact_activity(
         metric, start, values_by_source, resolution_minutes, unit
     )
-    await aingest_records(customer, records, source, admin_create_date, batch_size)
+    await aingest_records(
+        customer, records, source, admin_create_date, batch_size, save_records
+    )
     if not return_results:
         return None
     n = max((len(v) for v, _ in values_by_source), default=0)

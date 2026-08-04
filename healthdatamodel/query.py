@@ -58,8 +58,22 @@ from django.db.models import Case, F, FloatField, IntegerField, Q, Value, When, 
 from django.db.models.expressions import Func
 from django.db.models.functions import Cast, Rank, Replace
 
-from healthdatamodel.constants import ConnectionStatus, DataSource
-from healthdatamodel.models import DataSourceRanking, Record, WearableConnection
+from healthdatamodel.compact import read_compact_enabled
+from healthdatamodel.constants import (
+    ASLEEP_STAGES,
+    HK_TYPE_TO_COMPACT_METRIC,
+    MINUTES_PER_DAY,
+    SLEEP_TYPE,
+    ConnectionStatus,
+    DataSource,
+)
+from healthdatamodel.models import (
+    ActivityDay,
+    DataSourceRanking,
+    Record,
+    SleepDay,
+    WearableConnection,
+)
 
 _DEFAULT_SLEEP_DEVICE_SORT_ORDER = ["oura", "whoop", "apple", "garmin"]
 
@@ -96,8 +110,7 @@ class SleepValue(StrEnum):
     IN_BED = "HKCategoryValueSleepAnalysisInBed"
 
 
-SLEEP_TYPE = "HKCategoryTypeIdentifierSleepAnalysis"
-
+# SLEEP_TYPE is defined in constants and re-exported here for compatibility.
 _SLEEP_TYPE = SLEEP_TYPE
 _SLEEP_VALUE_PREFIX = "HKCategoryValueSleepAnalysisAsleep"
 
@@ -150,6 +163,27 @@ def _preferred_sleep_brand(customer: Any) -> str:
     return conn.device_brand if conn else ""
 
 
+def _rank_sleep_devices(customer: Any, devices: list[str]) -> list[str]:
+    """Order *devices* by sleep preference (best first).
+
+    Preference: the customer's ``preferred_for_sleep`` WearableConnection
+    brand, then the default order (oura, whoop, apple, garmin), then
+    alphabetical.
+    """
+    if len(devices) <= 1:
+        return devices
+    preferred = _preferred_sleep_brand(customer)
+    sort_order = _DEFAULT_SLEEP_DEVICE_SORT_ORDER + sorted(d.lower() for d in devices)
+    if preferred:
+        sort_order = [preferred.lower()] + sort_order
+    return sorted(
+        devices,
+        key=lambda d: (
+            sort_order.index(d.lower()) if d.lower() in sort_order else len(sort_order)
+        ),
+    )
+
+
 def _sleep_for_day(customer: Any, day: date, boundary_hour: int) -> DailySleep:
     start_time, end_time = _day_window(day, boundary_hour)
 
@@ -175,22 +209,7 @@ def _sleep_for_day(customer: Any, day: date, boundary_hour: int) -> DailySleep:
         .values_list("sourceName", flat=True)
         .distinct()
     )
-
-    if len(devices) > 1:
-        preferred = _preferred_sleep_brand(customer)
-        sort_order = _DEFAULT_SLEEP_DEVICE_SORT_ORDER + sorted(
-            d.lower() for d in devices
-        )
-        if preferred:
-            sort_order = [preferred.lower()] + sort_order
-        devices = sorted(
-            devices,
-            key=lambda d: (
-                sort_order.index(d.lower())
-                if d.lower() in sort_order
-                else len(sort_order)
-            ),
-        )
+    devices = _rank_sleep_devices(customer, devices)
 
     records_for_device = sleep_qs.filter(
         admin_create_date=upload_dt, sourceName=devices[0]
@@ -205,6 +224,94 @@ def _sleep_for_day(customer: Any, day: date, boundary_hour: int) -> DailySleep:
     )
     wake_time = min(max(end for _, end in pairs), end_time)
     return DailySleep(hours=minutes / 60.0, wake_time=wake_time)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — compact read paths
+# ---------------------------------------------------------------------------
+
+
+def _parse_sleep_intervals(
+    row_intervals: list[Any],
+) -> list[tuple[datetime, datetime]]:
+    """Parse a SleepDay ``intervals`` JSON list into asleep (start, end) pairs."""
+    pairs = []
+    for entry in row_intervals:
+        start_iso, end_iso, stage = entry
+        if stage not in ASLEEP_STAGES:
+            continue
+        pairs.append(
+            (datetime.fromisoformat(start_iso), datetime.fromisoformat(end_iso))
+        )
+    return pairs
+
+
+def _get_sleep_by_day_compact(
+    customer: Any, start: date, end: date, boundary_hour: int
+) -> dict[date, DailySleep]:
+    """Compact-table implementation of :func:`get_sleep_by_day`.
+
+    Stored rows are canonicalised to the 14:00 UTC boundary; because their
+    interval pieces exactly tile the original records, any requested
+    ``boundary_hour`` can be served by clipping pieces from the (at most two)
+    stored days overlapping each requested window.
+    """
+    rows = list(
+        SleepDay.objects.filter(
+            customer=customer,
+            day__gte=start - timedelta(days=1),
+            day__lte=end + timedelta(days=1),
+        )
+    )
+    parsed = [(row, _parse_sleep_intervals(row.intervals)) for row in rows]
+
+    results: dict[date, DailySleep] = {}
+    for i in range((end - start).days + 1):
+        day = start + timedelta(days=i)
+        window_start, window_end = _day_window(day, boundary_hour)
+
+        # Candidate rows: any asleep interval strictly overlapping the window.
+        candidates = []
+        for row, intervals in parsed:
+            overlapping = [
+                (s, e)
+                for s, e in intervals
+                if max(s, window_start) < min(e, window_end)
+            ]
+            if overlapping:
+                candidates.append((row, overlapping))
+
+        if not candidates:
+            results[day] = DailySleep(hours=None, wake_time=None)
+            continue
+
+        # Latest upload wins, mirroring the legacy per-window behaviour.
+        upload_dt = max(row.admin_create_date for row, _ in candidates)
+        current = [
+            (row, intervals)
+            for row, intervals in candidates
+            if row.admin_create_date == upload_dt
+        ]
+        devices = _rank_sleep_devices(
+            customer, sorted({row.device for row, _ in current})
+        )
+        chosen = devices[0]
+        pairs = {
+            (s, e)
+            for row, intervals in current
+            if row.device == chosen
+            for s, e in intervals
+        }
+        minutes = int(
+            sum(
+                (min(e, window_end) - max(s, window_start)).total_seconds()
+                for s, e in pairs
+            )
+            // 60
+        )
+        wake_time = min(max(e for _, e in pairs), window_end)
+        results[day] = DailySleep(hours=minutes / 60.0, wake_time=wake_time)
+    return results
 
 
 def _active_data_source(customer: Any) -> str:
@@ -258,12 +365,57 @@ def has_competing_sources(
     end:
         Exclusive window end (datetime, UTC).
     """
+    if read_compact_enabled():
+        return _has_competing_sources_compact(customer, source, start, end)
     return Record.objects.filter(
         ~Q(source=source),
         customer=customer,
         startDate__gte=start,
         endDate__lte=end,
     ).exists()
+
+
+def _has_competing_sources_compact(
+    customer: Any, source: str, start: datetime, end: datetime
+) -> bool:
+    """Compact-table implementation of :func:`has_competing_sources`.
+
+    Mirrors the legacy check (records fully inside ``[start, end]``): an
+    activity slot or sleep interval piece from another source contained in
+    the window counts as competition.
+    """
+    day_lo = start.date()
+    day_hi = end.date() + timedelta(days=1)
+
+    activity_rows = ActivityDay.objects.filter(
+        ~Q(source=source),
+        customer=customer,
+        day__gte=day_lo - timedelta(days=1),
+        day__lte=day_hi,
+    ).values_list("day", "resolution_minutes", "values")
+    for day, resolution, values in activity_rows:
+        day_start = datetime.combine(day, time(0)).replace(tzinfo=timezone.utc)
+        for index, value in enumerate(values):
+            if value is None:
+                continue
+            slot_start = day_start + timedelta(minutes=index * resolution)
+            slot_end = slot_start + timedelta(minutes=resolution)
+            if slot_start >= start and slot_end <= end:
+                return True
+
+    sleep_rows = SleepDay.objects.filter(
+        ~Q(source=source),
+        customer=customer,
+        day__gte=day_lo - timedelta(days=1),
+        day__lte=day_hi,
+    ).values_list("intervals", flat=True)
+    for intervals in sleep_rows:
+        for start_iso, end_iso, _stage in intervals:
+            piece_start = datetime.fromisoformat(start_iso)
+            piece_end = datetime.fromisoformat(end_iso)
+            if piece_start >= start and piece_end <= end:
+                return True
+    return False
 
 
 def ensure_ranks(customer: Any) -> None:
@@ -342,6 +494,8 @@ def get_sleep_by_day(
         * ``wake_time`` — end of last sleep interval capped at day boundary,
           or ``None`` if no records.  Not rounded.
     """
+    if read_compact_enabled():
+        return _get_sleep_by_day_compact(customer, start, end, day_boundary_hour)
     return {
         start + timedelta(days=i): _sleep_for_day(
             customer, start + timedelta(days=i), day_boundary_hour
@@ -434,6 +588,10 @@ def get_activity_records(
         ``(startDate, endDate, value)`` tuples, sorted ascending by start.
         Values are in kcal for calorie metrics and count for steps.
     """
+    if read_compact_enabled():
+        return _get_activity_records_compact(
+            customer, metric, start, end, resolution_minutes
+        )
     ensure_ranks(customer)
 
     sql, params = (
@@ -497,6 +655,68 @@ ORDER BY r."startDate" """.format(sql),
         rows = cursor.fetchall()
 
     return [(row[0], row[1], float(row[2])) for row in rows]
+
+
+def _get_activity_records_compact(
+    customer: Any,
+    metric: ActivityMetric,
+    start: datetime,
+    end: datetime,
+    resolution_minutes: int,
+) -> list[tuple[datetime, datetime, float]]:
+    """Compact-table implementation of :func:`get_activity_records`.
+
+    Pure Python over per-day vectors — works on any backend.  Per slot, the
+    best-ranked source with data wins; devices within the winning source are
+    summed (mirroring the legacy rank-tie behaviour).  Note the compact
+    tables only hold resolutions that divide a day evenly.
+    """
+    compact_metric = HK_TYPE_TO_COMPACT_METRIC.get(metric.value)
+    if compact_metric is None or MINUTES_PER_DAY % resolution_minutes != 0:
+        return []
+    if end <= start:
+        return []
+    ensure_ranks(customer)
+    rank_by_source = dict(
+        DataSourceRanking.objects.filter(customer=customer).values_list(
+            "dataSource", "rank"
+        )
+    )
+
+    rows = ActivityDay.objects.filter(
+        customer=customer,
+        metric=compact_metric.value,
+        resolution_minutes=resolution_minutes,
+        day__gte=start.date(),
+        day__lte=(end - timedelta(microseconds=1)).date(),
+    ).values_list("source", "day", "values")
+
+    # (day, slot) -> {source: summed value across devices}
+    slots: dict[tuple[date, int], dict[str, float]] = defaultdict(dict)
+    for source, day, values in rows:
+        if source not in rank_by_source:
+            continue  # legacy path drops sources without a ranking row
+        day_start = datetime.combine(day, time(0)).replace(tzinfo=timezone.utc)
+        for index, value in enumerate(values):
+            if value is None:
+                continue
+            slot_start = day_start + timedelta(minutes=index * resolution_minutes)
+            slot_end = slot_start + timedelta(minutes=resolution_minutes)
+            if slot_start < start or slot_end > end:
+                continue
+            by_source = slots[(day, index)]
+            by_source[source] = by_source.get(source, 0.0) + float(value)
+
+    results: list[tuple[datetime, datetime, float]] = []
+    for day, index in sorted(slots):
+        by_source = slots[(day, index)]
+        best_source = min(by_source, key=lambda s: rank_by_source[s])
+        slot_start = datetime.combine(day, time(0)).replace(
+            tzinfo=timezone.utc
+        ) + timedelta(minutes=index * resolution_minutes)
+        slot_end = slot_start + timedelta(minutes=resolution_minutes)
+        results.append((slot_start, slot_end, by_source[best_source]))
+    return results
 
 
 def get_activity_by_day(
