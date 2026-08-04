@@ -45,6 +45,7 @@ packages = ["healthdatamodel"]
 [dependency-groups]
 dev = [
     "anyio[trio]",
+    "psycopg[binary]>=3.3.4",
     "pytest",
     "pytest-asyncio",
     "pytest-django",

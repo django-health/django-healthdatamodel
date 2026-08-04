@@ -718,7 +718,10 @@ class TestActivityByDay:
 
     def test_devices_within_source_summed(self, customer):
         # Two devices in the same source at the same interval tie on rank and
-        # are both counted (legacy Rank() tie behaviour).
+        # are both counted.  Representation differs between paths (legacy
+        # returns one tuple per tied device row, compact returns one
+        # pre-summed tuple per slot); the invariant is the per-interval sum,
+        # which is what day-level aggregation consumes.
         start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
         _activity_record(customer, start_dt, start_dt + timedelta(minutes=15), "100")
         _activity_record(
@@ -735,8 +738,10 @@ class TestActivityByDay:
             start_dt + timedelta(days=1),
             resolution_minutes=15,
         )
-        assert len(result) == 1
-        assert result[0][2] == pytest.approx(150.0)
+        assert {(r[0], r[1]) for r in result} == {
+            (start_dt, start_dt + timedelta(minutes=15))
+        }
+        assert sum(r[2] for r in result) == pytest.approx(150.0)
 
     def test_latest_upload_wins_per_interval(self, customer):
         start_dt = datetime.combine(TODAY, time(0)).replace(tzinfo=timezone.utc)
