@@ -114,12 +114,12 @@ class Record(models.Model):
     admin_create_date = models.DateTimeField()
 
     class Meta:
-        indexes = [
+        indexes = (
             models.Index(
                 fields=["customer", "type", "startDate"],
                 name="record_customer_type_start_idx",
             ),
-        ]
+        )
 
     def __str__(self):
         return f"{self.customer} {self.type} {self.startDate=} {self.endDate=} {self.creationDate=} {self.admin_create_date=} {self.value=} {self.unit=}"
@@ -174,13 +174,13 @@ class WearableConnection(models.Model):
     last_synced_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        constraints = [
+        constraints = (
             models.UniqueConstraint(
                 fields=["customer", "data_source"],
                 name="unique_customer_data_source",
             ),
-        ]
-        ordering = ["connected_at"]
+        )
+        ordering = ("connected_at",)
 
     def __str__(self) -> str:
         return f"{self.customer} — {self.data_source} ({self.device_brand}) [{self.status}]"

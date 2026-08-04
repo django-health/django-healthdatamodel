@@ -102,7 +102,7 @@ class StartDateFilter(DateRangeFilter):
 
 
 class WorkoutAdmin(ReadonlyMixin):
-    list_display = [
+    list_display = (
         "customer_id",
         "customer_email",
         "workoutActivityType",
@@ -110,14 +110,14 @@ class WorkoutAdmin(ReadonlyMixin):
         "endDate",
         "creationDate",
         "admin_create_date",
-    ]
-    search_fields = [
+    )
+    search_fields = (
         "workoutActivityType",
         "customer__email",
-    ]
+    )
     search_help_text = "Search by activity type or customer email"
-    list_filter = ["workoutActivityType", StartDateFilter]
-    ordering = ["-startDate"]
+    list_filter = ("workoutActivityType", StartDateFilter)
+    ordering = ("-startDate",)
     list_per_page = 25
     list_select_related = ("customer",)
     show_full_result_count = False
@@ -134,21 +134,21 @@ class WorkoutAdmin(ReadonlyMixin):
 
 
 class RecordAdmin(ReadonlyMixin):
-    list_display = [
+    list_display = (
         "customer_id",
         "customer_email",
         "type",
         "startDate",
         "endDate",
         "admin_create_date",
-    ]
-    search_fields = [
+    )
+    search_fields = (
         "type",
         "customer__email",
-    ]
+    )
     search_help_text = "Search by record type or customer email"
-    list_filter = ["type", StartDateFilter]
-    ordering = ["-startDate"]
+    list_filter = ("type", StartDateFilter)
+    ordering = ("-startDate",)
     list_per_page = 25
     list_select_related = ("customer",)
     show_full_result_count = False
@@ -166,14 +166,14 @@ class RecordAdmin(ReadonlyMixin):
 
 class DataSourceRankingAdmin(admin.ModelAdmin, ExportCsvMixin):
     list_display = ("customer", "dataSource", "rank")
-    search_fields = ["customer__email"]
+    search_fields = ("customer__email",)
     search_help_text = "Search by customer email"
     list_filter = ("dataSource",)
     ordering = ("customer", "rank")
     list_per_page = 25
     list_select_related = ("customer",)
     raw_id_fields = ("customer",)
-    actions = ["export_as_csv"]
+    actions = ("export_as_csv",)
 
 
 class WorkoutMetadataEntryAdmin(admin.ModelAdmin):
@@ -200,11 +200,11 @@ class WearableConnectionAdmin(admin.ModelAdmin):
         "connected_at",
         "last_synced_at",
     )
-    search_fields = [
+    search_fields = (
         "customer__email",
         "customer__first_name",
         "customer__last_name",
-    ]
+    )
     search_help_text = "Search by customer email or name"
     list_filter = ("data_source", "device_brand", "status")
     ordering = ("-connected_at",)

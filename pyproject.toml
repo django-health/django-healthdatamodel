@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "django-healthdatamodel"
-version = "0.9.1"
+version = "0.9.0"
 description = "A Django app providing a unified data model for personal health and activity data."
 readme = "README.md"
 authors = [
@@ -54,3 +54,6 @@ dev = [
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 asyncio_mode = "auto"
+
+[tool.ruff.lint.per-file-ignores]
+"*/migrations/*" = ["RUF012"]

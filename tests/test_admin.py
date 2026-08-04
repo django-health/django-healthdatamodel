@@ -34,7 +34,7 @@ class TestWearableConnectionAdmin:
         )
 
         queryset = WearableConnection.objects.all()
-        filtered_queryset, use_distinct = admin_instance.get_search_results(
+        filtered_queryset, _use_distinct = admin_instance.get_search_results(
             request, queryset, "Default"
         )
 
