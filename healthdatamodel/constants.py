@@ -25,3 +25,24 @@ class DeviceBrand(models.TextChoices):
 class ConnectionStatus(models.TextChoices):
     ACTIVE = "active", "Active"
     DISCONNECTED = "disconnected", "Disconnected"
+
+
+# Sources that relay data recorded by a physical device of a possibly
+# different brand (an Apple Health connection may be fed by a Garmin watch).
+# Only for these does ``device_brand`` carry information the source doesn't.
+AGGREGATOR_SOURCES = frozenset(
+    {
+        DataSource.APPLE_HEALTH,
+        DataSource.GOOGLE_HEALTH,
+        DataSource.HEALTH_CONNECT,
+        DataSource.STRAVA,
+    }
+)
+
+# Direct-device sources imply the physical brand.
+SOURCE_IMPLIED_BRAND = {
+    DataSource.FITBIT: DeviceBrand.FITBIT,
+    DataSource.GARMIN: DeviceBrand.GARMIN,
+    DataSource.OURA: DeviceBrand.OURA,
+    DataSource.WHOOP: DeviceBrand.WHOOP,
+}
