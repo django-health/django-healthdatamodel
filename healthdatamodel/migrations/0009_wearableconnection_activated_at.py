@@ -4,15 +4,14 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('healthdatamodel', '0008_record_strava_choice'),
+        ("healthdatamodel", "0008_record_strava_choice"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='wearableconnection',
-            name='activated_at',
+            model_name="wearableconnection",
+            name="activated_at",
             field=models.DateTimeField(blank=True, null=True),
         ),
     ]

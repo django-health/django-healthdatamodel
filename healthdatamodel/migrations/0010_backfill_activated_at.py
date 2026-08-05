@@ -11,7 +11,6 @@ def backfill_activated_at(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("healthdatamodel", "0009_wearableconnection_activated_at"),
     ]
