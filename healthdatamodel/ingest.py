@@ -32,7 +32,6 @@ from healthdatamodel.models import Record, Workout, WorkoutMetadataEntry
 from healthdatamodel.query import ActivityMetric
 from healthdatamodel.schemas import RecordInput, WorkoutInput
 
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

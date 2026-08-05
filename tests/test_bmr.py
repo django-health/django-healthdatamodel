@@ -1,6 +1,5 @@
 from datetime import date
 
-
 from healthdatamodel.bmr import DEFAULT_BMR, age_from_dob, get_bmr
 
 

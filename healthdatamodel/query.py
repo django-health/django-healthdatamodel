@@ -484,14 +484,14 @@ def get_activity_records(
 
     with connection.cursor() as cursor:
         cursor.execute(
-            """WITH ranked AS ({})
+            f"""WITH ranked AS ({sql})
 SELECT
     r."startDate",
     r."endDate",
     r."value_nonneg"
 FROM ranked r
 WHERE r."source_rank_rank" = %s AND r."source_update_rank" = %s
-ORDER BY r."startDate" """.format(sql),
+ORDER BY r."startDate" """,
             [*params, 1, 1],
         )
         rows = cursor.fetchall()
