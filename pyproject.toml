@@ -57,3 +57,4 @@ asyncio_mode = "auto"
 
 [tool.ruff.lint.per-file-ignores]
 "*/migrations/*" = ["RUF012"]
+"healthdatamodel/models.py" = ["RUF012"]
