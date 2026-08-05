@@ -270,6 +270,8 @@ class WearableConnection(models.Model):
     def deactivate_data_source(cls, customer, data_source) -> None:
         """
         Deactivate the connection for the given user's source (assuming we have one).
+
+        Could return the connection (or None if there isn't one)...but we don't.
         """
         cls.objects.filter(customer=customer, data_source=data_source).update(
             status=ConnectionStatus.DISCONNECTED,

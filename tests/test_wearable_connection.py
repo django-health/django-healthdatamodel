@@ -218,7 +218,7 @@ class TestActivate:
             customer=user, status=ConnectionStatus.ACTIVE
         )
         assert active.count() == 2
-        WearableConnection.deactivate(user, DataSource.FITBIT)
+        WearableConnection.deactivate_data_source(user, DataSource.FITBIT)
         active = WearableConnection.objects.filter(
             customer=user, status=ConnectionStatus.ACTIVE
         )
