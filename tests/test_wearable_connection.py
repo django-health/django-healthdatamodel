@@ -193,6 +193,10 @@ class TestActivate:
         conn = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
         assert conn.status == ConnectionStatus.ACTIVE
         assert conn.device_brand == ""
+        active = WearableConnection.objects.filter(
+            customer=user, status=ConnectionStatus.ACTIVE
+        )
+        assert active.count() == 1
 
     def test_explicit_brand_wins(self, user):
         conn = WearableConnection.activate(
@@ -204,19 +208,26 @@ class TestActivate:
         conn = WearableConnection.activate(user, DataSource.FITBIT)
         assert conn.device_brand == DeviceBrand.FITBIT
 
-    def test_deactivates_other_connections(self, user):
-        WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+    def test_deactivates_connection(self, user):
+        """
+        Hit both deactivation paths...
+        """
+        conn1 = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
         WearableConnection.activate(user, DataSource.FITBIT)
         active = WearableConnection.objects.filter(
             customer=user, status=ConnectionStatus.ACTIVE
         )
-        assert active.count() == 1
-        assert active.first().data_source == DataSource.FITBIT
-        disconnected = WearableConnection.objects.get(
-            customer=user, data_source=DataSource.APPLE_HEALTH
+        assert active.count() == 2
+        WearableConnection.deactivate(user, DataSource.FITBIT)
+        active = WearableConnection.objects.filter(
+            customer=user, status=ConnectionStatus.ACTIVE
         )
-        assert disconnected.status == ConnectionStatus.DISCONNECTED
-        assert disconnected.disconnected_at is not None
+        assert active.count() == 1
+        conn1.deactivate()
+        active = WearableConnection.objects.filter(
+            customer=user, status=ConnectionStatus.ACTIVE
+        )
+        assert active.count() == 0
 
     def test_reactivate_clears_disconnected_at_and_keeps_brand(self, user):
         WearableConnection.activate(

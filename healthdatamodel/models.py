@@ -266,6 +266,16 @@ class WearableConnection(models.Model):
         self.disconnected_at = datetime.now(timezone.utc)
         self.save(update_fields=["status", "disconnected_at"])
 
+    @classmethod
+    def deactivate_data_source(cls, customer, data_source) -> None:
+        """
+        Deactivate the connection for the given user's source (assuming we have one).
+        """
+        cls.objects.filter(customer=customer, data_source=data_source).update(
+            status=ConnectionStatus.DISCONNECTED,
+            disconnected_at=datetime.now(timezone.utc),
+        )
+
 
 # Need to keep these arround for the old migrations
 class TruncatingCharField(models.CharField):
