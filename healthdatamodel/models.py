@@ -210,7 +210,8 @@ class WearableConnection(models.Model):
     def activate(
         cls, customer, data_source: str, device_brand: str = ""
     ) -> "WearableConnection":
-        """Make ``data_source`` the customer's single active connection.
+        """Make ``data_source`` an active connection, carrying forward
+        device brand if not supplied.
 
         Brand resolution, in order: an explicit ``device_brand`` argument;
         the brand implied by a direct-device source; the brand already on the
@@ -240,12 +241,6 @@ class WearableConnection(models.Model):
         if brand != conn.device_brand:
             conn.device_brand = brand
             conn.save(update_fields=["device_brand"])
-        cls.objects.filter(customer=customer, status=ConnectionStatus.ACTIVE).exclude(
-            pk=conn.pk
-        ).update(
-            status=ConnectionStatus.DISCONNECTED,
-            disconnected_at=datetime.now(timezone.utc),
-        )
         return conn
 
     @classmethod
@@ -262,6 +257,14 @@ class WearableConnection(models.Model):
             conn.device_brand = device_brand
             conn.save(update_fields=["device_brand"])
         return conn
+
+    def deactivate(self) -> None:
+        """
+        Deactivate this connection.
+        """
+        self.status = ConnectionStatus.DISCONNECTED
+        self.disconnected_at = datetime.now(timezone.utc)
+        self.save(update_fields=["status", "disconnected_at"])
 
 
 # Need to keep these arround for the old migrations
