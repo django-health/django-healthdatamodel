@@ -178,6 +178,7 @@ class WearableConnection(models.Model):
         help_text="If True, this connection's device_brand is preferred when choosing sleep data.",
     )
     connected_at = models.DateTimeField(auto_now_add=True)
+    activated_at = models.DateTimeField(null=True, blank=True)
     disconnected_at = models.DateTimeField(null=True, blank=True)
     last_synced_at = models.DateTimeField(null=True, blank=True)
 
@@ -199,10 +200,18 @@ class WearableConnection(models.Model):
 
     @classmethod
     def active_for(cls, customer) -> "WearableConnection | None":
-        """The customer's primary connection: most recently connected active row."""
+        """The customer's primary connection: most recently activated active row.
+
+        Rows that predate ``activated_at`` (or were created outside
+        ``activate``) sort after stamped rows, by ``connected_at``.
+        """
         return (
             cls.objects.filter(customer=customer, status=ConnectionStatus.ACTIVE)
-            .order_by("-connected_at", "-pk")
+            .order_by(
+                models.F("activated_at").desc(nulls_last=True),
+                "-connected_at",
+                "-pk",
+            )
             .first()
         )
 
@@ -216,15 +225,19 @@ class WearableConnection(models.Model):
         Brand resolution, in order: an explicit ``device_brand`` argument;
         the brand implied by a direct-device source; the brand already on the
         row being reactivated; for aggregator sources, the brand carried
-        forward from the outgoing active connection.  The carry-forward is
+        forward from the current primary connection.  The carry-forward is
         what keeps a Garmin user's brand across e.g. an apple_health →
         google_health switch without callers mirroring it onto both rows.
         """
-        outgoing = cls.active_for(customer)
+        primary = cls.active_for(customer)
         conn, _created = cls.objects.update_or_create(
             customer=customer,
             data_source=data_source,
-            defaults={"status": ConnectionStatus.ACTIVE, "disconnected_at": None},
+            defaults={
+                "status": ConnectionStatus.ACTIVE,
+                "activated_at": datetime.now(timezone.utc),
+                "disconnected_at": None,
+            },
         )
         brand = (
             device_brand
@@ -234,10 +247,10 @@ class WearableConnection(models.Model):
         if (
             not brand
             and data_source in AGGREGATOR_SOURCES
-            and outgoing is not None
-            and outgoing.pk != conn.pk
+            and primary is not None
+            and primary.pk != conn.pk
         ):
-            brand = outgoing.device_brand
+            brand = primary.device_brand
         if brand != conn.device_brand:
             conn.device_brand = brand
             conn.save(update_fields=["device_brand"])
@@ -267,16 +280,23 @@ class WearableConnection(models.Model):
         self.save(update_fields=["status", "disconnected_at"])
 
     @classmethod
-    def deactivate_data_source(cls, customer, data_source) -> None:
-        """
-        Deactivate the connection for the given user's source (assuming we have one).
+    def deactivate_data_source(
+        cls, customer, data_source
+    ) -> "WearableConnection | None":
+        """Deactivate the customer's active connection for ``data_source``.
 
-        Could return the connection (or None if there isn't one)...but we don't.
+        Returns the deactivated connection, or None when there was no active
+        one — already-disconnected rows keep their original ``disconnected_at``.
         """
-        cls.objects.filter(customer=customer, data_source=data_source).update(
-            status=ConnectionStatus.DISCONNECTED,
-            disconnected_at=datetime.now(timezone.utc),
-        )
+        conn = cls.objects.filter(
+            customer=customer,
+            data_source=data_source,
+            status=ConnectionStatus.ACTIVE,
+        ).first()
+        if conn is None:
+            return None
+        conn.deactivate()
+        return conn
 
 
 # Need to keep these arround for the old migrations

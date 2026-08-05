@@ -171,7 +171,14 @@ class TestActiveFor:
         )
         assert WearableConnection.active_for(user) is None
 
-    def test_most_recently_connected_active_wins(self, user):
+    def test_most_recently_activated_wins(self, user):
+        fitbit = WearableConnection.activate(user, DataSource.FITBIT)
+        WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+        # reactivating the older connection makes it primary again
+        WearableConnection.activate(user, DataSource.FITBIT)
+        assert WearableConnection.active_for(user).pk == fitbit.pk
+
+    def test_falls_back_to_connected_at_without_activated_at(self, user):
         older = WearableConnection.objects.create(
             customer=user, data_source=DataSource.FITBIT
         )
@@ -187,11 +194,22 @@ class TestActiveFor:
         )
         assert WearableConnection.active_for(user).pk == newer.pk
 
+    def test_stamped_rows_beat_unstamped_rows(self, user):
+        unstamped = WearableConnection.objects.create(
+            customer=user, data_source=DataSource.FITBIT
+        )
+        WearableConnection.objects.filter(pk=unstamped.pk).update(
+            connected_at=datetime(2026, 6, 1, tzinfo=timezone.utc)
+        )
+        stamped = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+        assert WearableConnection.active_for(user).pk == stamped.pk
+
 
 class TestActivate:
     def test_creates_active_row(self, user):
         conn = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
         assert conn.status == ConnectionStatus.ACTIVE
+        assert conn.activated_at is not None
         assert conn.device_brand == ""
         active = WearableConnection.objects.filter(
             customer=user, status=ConnectionStatus.ACTIVE
@@ -208,31 +226,19 @@ class TestActivate:
         conn = WearableConnection.activate(user, DataSource.FITBIT)
         assert conn.device_brand == DeviceBrand.FITBIT
 
-    def test_deactivates_connection(self, user):
-        """
-        Hit both deactivation paths...
-        """
-        conn1 = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+    def test_leaves_other_active_connections_alone(self, user):
+        WearableConnection.activate(user, DataSource.APPLE_HEALTH)
         WearableConnection.activate(user, DataSource.FITBIT)
         active = WearableConnection.objects.filter(
             customer=user, status=ConnectionStatus.ACTIVE
         )
         assert active.count() == 2
-        WearableConnection.deactivate_data_source(user, DataSource.FITBIT)
-        active = WearableConnection.objects.filter(
-            customer=user, status=ConnectionStatus.ACTIVE
-        )
-        assert active.count() == 1
-        conn1.deactivate()
-        active = WearableConnection.objects.filter(
-            customer=user, status=ConnectionStatus.ACTIVE
-        )
-        assert active.count() == 0
 
     def test_reactivate_clears_disconnected_at_and_keeps_brand(self, user):
         WearableConnection.activate(
             user, DataSource.APPLE_HEALTH, device_brand=DeviceBrand.OURA
         )
+        WearableConnection.deactivate_data_source(user, DataSource.APPLE_HEALTH)
         WearableConnection.activate(user, DataSource.FITBIT)
         conn = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
         assert conn.status == ConnectionStatus.ACTIVE
@@ -267,6 +273,48 @@ class TestActivate:
             ).count()
             == 1
         )
+
+
+class TestDeactivate:
+    def test_deactivate_instance(self, user):
+        conn = WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+        conn.deactivate()
+        conn.refresh_from_db()
+        assert conn.status == ConnectionStatus.DISCONNECTED
+        assert conn.disconnected_at is not None
+
+    def test_deactivate_data_source_returns_connection(self, user):
+        WearableConnection.activate(user, DataSource.FITBIT)
+        conn = WearableConnection.deactivate_data_source(user, DataSource.FITBIT)
+        assert conn is not None
+        assert conn.status == ConnectionStatus.DISCONNECTED
+        assert conn.disconnected_at is not None
+
+    def test_deactivate_data_source_none_without_connection(self, user):
+        assert (
+            WearableConnection.deactivate_data_source(user, DataSource.FITBIT) is None
+        )
+
+    def test_repeat_call_keeps_original_disconnected_at(self, user):
+        WearableConnection.activate(user, DataSource.FITBIT)
+        first = WearableConnection.deactivate_data_source(user, DataSource.FITBIT)
+        assert (
+            WearableConnection.deactivate_data_source(user, DataSource.FITBIT) is None
+        )
+        conn = WearableConnection.objects.get(
+            customer=user, data_source=DataSource.FITBIT
+        )
+        assert conn.disconnected_at == first.disconnected_at
+
+    def test_leaves_other_sources_alone(self, user):
+        WearableConnection.activate(user, DataSource.APPLE_HEALTH)
+        WearableConnection.activate(user, DataSource.FITBIT)
+        WearableConnection.deactivate_data_source(user, DataSource.FITBIT)
+        active = WearableConnection.objects.filter(
+            customer=user, status=ConnectionStatus.ACTIVE
+        )
+        assert active.count() == 1
+        assert active.first().data_source == DataSource.APPLE_HEALTH
 
 
 class TestSetBrand:
