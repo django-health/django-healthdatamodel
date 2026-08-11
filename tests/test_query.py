@@ -343,6 +343,44 @@ class TestSleepHoursMultiDevice:
         result = get_sleep_hours_by_day(customer, TODAY, TODAY)
         assert result[TODAY] == pytest.approx(4.5)
 
+    def test_fallback_is_newest_connection_but_flag_beats_recency(self, customer):
+        # Same records as above: apple slept 3h, garmin slept 4.5h.
+        _sleep_record(
+            customer,
+            start=datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(TODAY, time(2)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisAsleepUnspecified",
+            sourceName="apple",
+        )
+        _sleep_record(
+            customer,
+            start=datetime.combine(TODAY, time(2, 30)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisAsleepUnspecified",
+            sourceName="garmin",
+        )
+        older = WearableConnection.objects.create(
+            customer=customer,
+            data_source=DataSource.APPLE_HEALTH,
+            device_brand="garmin",
+            status="active",
+        )
+        WearableConnection.objects.create(
+            customer=customer,
+            data_source=DataSource.FITBIT,
+            device_brand="apple",
+            status="active",
+        )
+        # No flag: the newest active connection's brand (apple) breaks the tie,
+        # matching WearableConnection.active_for's primary-connection ordering.
+        result = get_sleep_hours_by_day(customer, TODAY, TODAY)
+        assert result[TODAY] == pytest.approx(3.0)
+        # preferred_for_sleep on the older garmin connection beats recency.
+        older.preferred_for_sleep = True
+        older.save(update_fields=["preferred_for_sleep"])
+        result = get_sleep_hours_by_day(customer, TODAY, TODAY)
+        assert result[TODAY] == pytest.approx(4.5)
+
 
 # ---------------------------------------------------------------------------
 # get_sleep_by_day — wake_time

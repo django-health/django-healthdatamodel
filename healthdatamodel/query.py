@@ -131,22 +131,19 @@ def _day_window(day: date, boundary_hour: int) -> tuple[datetime, datetime]:
 
 
 def _preferred_sleep_brand(customer: Any) -> str:
-    """Return the preferred sleep device brand from WearableConnection, or ''."""
-    conn = WearableConnection.objects.filter(
+    """Return the preferred sleep device brand from WearableConnection, or ''.
+
+    An active connection flagged ``preferred_for_sleep`` (with a non-blank
+    brand) wins; otherwise fall back to the primary connection — the most
+    recently connected active row, matching ``WearableConnection.active_for``.
+    """
+    active = WearableConnection.objects.filter(
         customer=customer,
-        preferred_for_sleep=True,
         status=ConnectionStatus.ACTIVE,
-    ).first()
-    if conn:
-        return conn.device_brand
-    conn = (
-        WearableConnection.objects.filter(
-            customer=customer,
-            status=ConnectionStatus.ACTIVE,
-        )
-        .order_by("connected_at")
-        .first()
-    )
+    ).order_by("-connected_at", "-pk")
+    conn = active.filter(preferred_for_sleep=True).exclude(device_brand="").first()
+    if conn is None:
+        conn = active.first()
     return conn.device_brand if conn else ""
 
 
