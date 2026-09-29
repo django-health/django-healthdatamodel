@@ -50,10 +50,16 @@ The query module provides day-level aggregates and record-level queries. Callers
 
 ```python
 from healthdatamodel.query import (
-    ActivityMetric, SleepValue, SLEEP_TYPE, DailySleep,
-    ensure_ranks, has_competing_sources,
-    get_sleep_hours_by_day, get_sleep_by_day,
-    get_activity_by_day, get_activity_records,
+    ActivityMetric,
+    SleepValue,
+    SLEEP_TYPE,
+    DailySleep,
+    ensure_ranks,
+    has_competing_sources,
+    get_sleep_hours_by_day,
+    get_sleep_by_day,
+    get_activity_by_day,
+    get_activity_records,
 )
 ```
 
@@ -63,17 +69,17 @@ from healthdatamodel.query import (
 
 ```python
 ActivityMetric.ACTIVE_CALORIES  # "HKQuantityTypeIdentifierActiveEnergyBurned"
-ActivityMetric.BASAL_CALORIES   # "HKQuantityTypeIdentifierBasalEnergyBurned"
-ActivityMetric.STEPS            # "HKQuantityTypeIdentifierStepCount"
+ActivityMetric.BASAL_CALORIES  # "HKQuantityTypeIdentifierBasalEnergyBurned"
+ActivityMetric.STEPS  # "HKQuantityTypeIdentifierStepCount"
 
-SleepValue.ASLEEP_UNSPECIFIED   # "HKCategoryValueSleepAnalysisAsleepUnspecified"
-SleepValue.ASLEEP_CORE          # "HKCategoryValueSleepAnalysisAsleepCore"
-SleepValue.ASLEEP_DEEP          # "HKCategoryValueSleepAnalysisAsleepDeep"
-SleepValue.ASLEEP_REM           # "HKCategoryValueSleepAnalysisAsleepREM"
-SleepValue.AWAKE                # "HKCategoryValueSleepAnalysisAwake"
-SleepValue.IN_BED               # "HKCategoryValueSleepAnalysisInBed"
+SleepValue.ASLEEP_UNSPECIFIED  # "HKCategoryValueSleepAnalysisAsleepUnspecified"
+SleepValue.ASLEEP_CORE  # "HKCategoryValueSleepAnalysisAsleepCore"
+SleepValue.ASLEEP_DEEP  # "HKCategoryValueSleepAnalysisAsleepDeep"
+SleepValue.ASLEEP_REM  # "HKCategoryValueSleepAnalysisAsleepREM"
+SleepValue.AWAKE  # "HKCategoryValueSleepAnalysisAwake"
+SleepValue.IN_BED  # "HKCategoryValueSleepAnalysisInBed"
 
-SLEEP_TYPE                      # "HKCategoryTypeIdentifierSleepAnalysis"
+SLEEP_TYPE  # "HKCategoryTypeIdentifierSleepAnalysis"
 ```
 
 ### Sleep
@@ -106,16 +112,24 @@ Sleep functions work with any Django-supported backend (SQLite, PostgreSQL, etc.
 
 ```python
 from datetime import date, datetime, timezone
-from healthdatamodel.query import ActivityMetric, get_activity_by_day, get_activity_records
+from healthdatamodel.query import (
+    ActivityMetric,
+    get_activity_by_day,
+    get_activity_records,
+)
 
 # Daily totals
-totals = get_activity_by_day(customer, ActivityMetric.ACTIVE_CALORIES, date(2025, 6, 1), date(2025, 6, 7))
+totals = get_activity_by_day(
+    customer, ActivityMetric.ACTIVE_CALORIES, date(2025, 6, 1), date(2025, 6, 7)
+)
 # {date: kcal | None}
 
 # Records at any resolution (default 15 min)
 start = datetime(2025, 6, 1, tzinfo=timezone.utc)
-end   = datetime(2025, 6, 8, tzinfo=timezone.utc)
-records = get_activity_records(customer, ActivityMetric.STEPS, start, end, resolution_minutes=15)
+end = datetime(2025, 6, 8, tzinfo=timezone.utc)
+records = get_activity_records(
+    customer, ActivityMetric.STEPS, start, end, resolution_minutes=15
+)
 # [(startDate, endDate, value), ...]  — gaps not filled
 ```
 
@@ -166,7 +180,7 @@ records = [
         unit="kcal",
         type=ActivityMetric.ACTIVE_CALORIES,
     ),
-    ...
+    ...,
 ]
 ingest_records(customer, records, source=DataSource.APPLE_HEALTH)
 ```
@@ -179,9 +193,9 @@ from healthdatamodel.ingest import ingest_compact_activity, aingest_compact_acti
 ingest_compact_activity(
     customer=customer,
     metric=ActivityMetric.ACTIVE_CALORIES,
-    start=week_start,                          # datetime
+    start=week_start,  # datetime
     values_by_source=[
-        ([300.0, 0.0, 250.0, ...], "apple"),   # one array of 15-min values per source
+        ([300.0, 0.0, 250.0, ...], "apple"),  # one array of 15-min values per source
     ],
     resolution_minutes=15,
     unit="kcal",
@@ -221,7 +235,9 @@ This is equivalent to calling `get_activity_by_day` immediately after ingest whe
 from healthdatamodel.query import get_activity_by_day_from_records
 from healthdatamodel.ingest import expand_compact_activity
 
-records = expand_compact_activity(metric, start, values_by_source, resolution_minutes, unit)
+records = expand_compact_activity(
+    metric, start, values_by_source, resolution_minutes, unit
+)
 totals = get_activity_by_day_from_records(records, metric, start_date, end_date)
 # dict[date, float | None] — no database query
 ```
@@ -234,6 +250,7 @@ Admin classes (`WorkoutAdmin`, `RecordAdmin`, `WearableConnectionAdmin`, etc.) a
 from django.contrib import admin
 from healthdatamodel.admin import WearableConnectionAdmin as Base
 from healthdatamodel.models import WearableConnection
+
 
 @admin.register(WearableConnection)
 class WearableConnectionAdmin(Base):
