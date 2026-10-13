@@ -103,13 +103,25 @@ class SleepStage(models.TextChoices):
 
 
 #: HK sleep value string (``Record.value``) → compact stage.
+#:
+#: Values not in this map are not compacted: the router hands them back as
+#: leftovers, which go to ``Record`` (with a warning when
+#: ``save_records=False``).
 HK_SLEEP_VALUE_TO_STAGE = {
     "HKCategoryValueSleepAnalysisAsleepUnspecified": SleepStage.UNSPECIFIED,
+    # Android / Health Connect: the SLEEPING stage, and stage-less sessions
+    # from older app builds.  The legacy read path counts every value
+    # starting with "HKCategoryValueSleepAnalysisAsleep" as asleep, so this
+    # must map to an asleep stage to keep compact/legacy parity.
+    "HKCategoryValueSleepAnalysisAsleep": SleepStage.UNSPECIFIED,
     "HKCategoryValueSleepAnalysisAsleepCore": SleepStage.CORE,
     "HKCategoryValueSleepAnalysisAsleepDeep": SleepStage.DEEP,
     "HKCategoryValueSleepAnalysisAsleepREM": SleepStage.REM,
     "HKCategoryValueSleepAnalysisAwake": SleepStage.AWAKE,
     "HKCategoryValueSleepAnalysisInBed": SleepStage.IN_BED,
+    # Android / Health Connect OUT_OF_BED.  Not asleep (the legacy prefix
+    # filter excludes it too); kept as awake so no stage data is lost.
+    "HKCategoryValueSleepAnalysisOutOfBed": SleepStage.AWAKE,
 }
 
 #: Stages that count as sleep in the query API (mirrors the legacy
