@@ -90,6 +90,7 @@ from healthdatamodel.constants import (
     ASLEEP_STAGES,
     HK_TYPE_TO_COMPACT_METRIC,
     MINUTES_PER_DAY,
+    SLEEP_ASLEEP_VALUE_PREFIX,
     SLEEP_TYPE,
     ConnectionStatus,
     DataSource,
@@ -141,7 +142,7 @@ class SleepValue(StrEnum):
 
 # SLEEP_TYPE is defined in constants and re-exported here for compatibility.
 _SLEEP_TYPE = SLEEP_TYPE
-_SLEEP_VALUE_PREFIX = "HKCategoryValueSleepAnalysisAsleep"
+_SLEEP_VALUE_PREFIX = SLEEP_ASLEEP_VALUE_PREFIX
 
 
 class ActivityMetric(StrEnum):

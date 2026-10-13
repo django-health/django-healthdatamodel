@@ -310,6 +310,24 @@ class TestSleepHoursBasic:
         result = get_sleep_hours_by_day(customer, TODAY, TODAY)
         assert result[TODAY] is None
 
+    def test_unmapped_asleep_prefix_counts_as_asleep(self, customer):
+        # A future/unknown "...Asleep*" value is not in HK_SLEEP_VALUE_TO_STAGE.
+        # The legacy path counts it via the prefix filter; the compact router
+        # must store it as UNSPECIFIED so both read modes agree.
+        _sleep_record(
+            customer,
+            start=datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(TODAY, time(6)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisAsleepLight",
+        )
+        result = get_sleep_by_day(customer, TODAY, TODAY)
+        assert result[TODAY].hours == pytest.approx(7.0)
+        assert result[TODAY].wake_time == datetime.combine(TODAY, time(6)).replace(
+            tzinfo=timezone.utc
+        )
+        row = SleepDay.objects.get(customer=customer)
+        assert [entry[2] for entry in row.intervals] == ["unspecified"]
+
     def test_record_crossing_day_boundary_clipped(self, customer):
         # Record spans the entire window: 1pm yesterday → 3pm today.
         # Clipped to 2pm yesterday → 2pm today = 24h.
