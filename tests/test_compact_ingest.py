@@ -204,6 +204,52 @@ class TestSleepDayWrites:
         stages = {entry[2] for entry in row.intervals}
         assert stages == {SleepStage.DEEP.value, SleepStage.AWAKE.value}
 
+    def test_android_health_connect_values_compacted(self, customer):
+        ingest_records(
+            customer,
+            [
+                _sleep_input(
+                    datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc),
+                    datetime.combine(TODAY, time(3)).replace(tzinfo=timezone.utc),
+                    value="HKCategoryValueSleepAnalysisAsleep",
+                ),
+                _sleep_input(
+                    datetime.combine(TODAY, time(3)).replace(tzinfo=timezone.utc),
+                    datetime.combine(TODAY, time(3, 30)).replace(tzinfo=timezone.utc),
+                    value="HKCategoryValueSleepAnalysisOutOfBed",
+                ),
+            ],
+            source=DataSource.HEALTH_CONNECT,
+            admin_create_date=NOW,
+            save_records=False,
+        )
+        # Both values are compactable: nothing falls back to Record.
+        assert Record.objects.count() == 0
+        row = SleepDay.objects.get(customer=customer)
+        stages = sorted(entry[2] for entry in row.intervals)
+        assert stages == sorted([SleepStage.UNSPECIFIED.value, SleepStage.AWAKE.value])
+
+    def test_unknown_sleep_value_kept_in_record_with_warning(self, customer, caplog):
+        with caplog.at_level("WARNING", logger="healthdatamodel.ingest"):
+            ingest_records(
+                customer,
+                [
+                    _sleep_input(
+                        datetime.combine(YESTERDAY, time(23)).replace(
+                            tzinfo=timezone.utc
+                        ),
+                        datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
+                        value="HKCategoryValueSleepAnalysisSomethingNew",
+                    )
+                ],
+                source=DataSource.APPLE_HEALTH,
+                admin_create_date=NOW,
+                save_records=False,
+            )
+        assert SleepDay.objects.count() == 0
+        assert Record.objects.count() == 1
+        assert "could not be stored compactly" in caplog.text
+
     def test_unknown_sleep_value_goes_to_record_only(self, customer):
         ingest_records(
             customer,

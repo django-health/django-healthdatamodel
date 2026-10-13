@@ -103,6 +103,41 @@ class TestBackfill:
         assert SleepDay.objects.count() == 1
         assert ActivityDay.objects.count() == 1
 
+    def test_android_sleep_values_backfilled(self, customer, legacy_only):
+        ingest_records(
+            customer,
+            [
+                RecordInput(
+                    startDate=start,
+                    endDate=end,
+                    creationDate=NOW,
+                    sourceName="android",
+                    value=value,
+                    type=SLEEP_TYPE,
+                )
+                for start, end, value in (
+                    (
+                        datetime.combine(YESTERDAY, time(23)).replace(
+                            tzinfo=timezone.utc
+                        ),
+                        datetime.combine(TODAY, time(3)).replace(tzinfo=timezone.utc),
+                        "HKCategoryValueSleepAnalysisAsleep",
+                    ),
+                    (
+                        datetime.combine(TODAY, time(3)).replace(tzinfo=timezone.utc),
+                        datetime.combine(TODAY, time(4)).replace(tzinfo=timezone.utc),
+                        "HKCategoryValueSleepAnalysisOutOfBed",
+                    ),
+                )
+            ],
+            source=DataSource.HEALTH_CONNECT,
+            admin_create_date=NOW,
+        )
+        backfill_from_records()
+        row = SleepDay.objects.get(customer=customer)
+        assert len(row.intervals) == 2
+        assert get_sleep_hours_by_day(customer, TODAY, TODAY)[TODAY] == 4.0
+
     def test_replay_order_newest_upload_wins(self, customer, legacy_only):
         # Older upload has the longer night; newer upload replaces it.
         _ingest_night(

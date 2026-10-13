@@ -265,6 +265,49 @@ class TestSleepHoursBasic:
             assert result[TODAY] == pytest.approx(8.0), f"failed for {subtype}"
             _clear_health_data(customer)
 
+    def test_android_health_connect_values(self, customer):
+        # The Android app posts "...Asleep" (Health Connect SLEEPING, and
+        # stage-less sessions on older builds) and "...OutOfBed".  Asleep
+        # counts (legacy prefix match), OutOfBed does not.
+        night = [
+            (time(23), time(3), "HKCategoryValueSleepAnalysisAsleep"),
+            (time(3), time(3, 30), "HKCategoryValueSleepAnalysisOutOfBed"),
+            (time(3, 30), time(7), "HKCategoryValueSleepAnalysisAsleep"),
+        ]
+        ingest_records(
+            customer,
+            [
+                RecordInput(
+                    startDate=datetime.combine(
+                        YESTERDAY if start.hour >= 14 else TODAY, start
+                    ).replace(tzinfo=timezone.utc),
+                    endDate=datetime.combine(TODAY, end).replace(tzinfo=timezone.utc),
+                    creationDate=NOW,
+                    sourceName="android",
+                    value=value,
+                    type="HKCategoryTypeIdentifierSleepAnalysis",
+                )
+                for start, end, value in night
+            ],
+            source=DataSource.HEALTH_CONNECT,
+            admin_create_date=NOW,
+        )
+        result = get_sleep_by_day(customer, TODAY, TODAY)
+        assert result[TODAY].hours == pytest.approx(7.5)
+        assert result[TODAY].wake_time == datetime.combine(TODAY, time(7)).replace(
+            tzinfo=timezone.utc
+        )
+
+    def test_android_out_of_bed_alone_is_no_sleep(self, customer):
+        _sleep_record(
+            customer,
+            start=datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc),
+            end=datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
+            value="HKCategoryValueSleepAnalysisOutOfBed",
+        )
+        result = get_sleep_hours_by_day(customer, TODAY, TODAY)
+        assert result[TODAY] is None
+
     def test_record_crossing_day_boundary_clipped(self, customer):
         # Record spans the entire window: 1pm yesterday → 3pm today.
         # Clipped to 2pm yesterday → 2pm today = 24h.
