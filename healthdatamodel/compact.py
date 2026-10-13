@@ -42,12 +42,12 @@ from django.conf import settings as django_settings
 from django.db import connections, router, transaction
 
 from healthdatamodel.constants import (
-    HK_SLEEP_VALUE_TO_STAGE,
     HK_TYPE_TO_COMPACT_METRIC,
     MINUTES_PER_DAY,
     SLEEP_DAY_BOUNDARY_HOUR,
     SLEEP_TYPE,
     CompactMetric,
+    sleep_stage_for_value,
 )
 from healthdatamodel.models import ActivityDay, SleepDay
 
@@ -187,7 +187,7 @@ def route_records(
     for record in records:
         device = record.sourceName
         if record.type == SLEEP_TYPE:
-            stage = HK_SLEEP_VALUE_TO_STAGE.get(record.value)
+            stage = sleep_stage_for_value(record.value)
             if stage is None:
                 leftovers.append(record)
                 continue

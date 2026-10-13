@@ -104,9 +104,10 @@ class SleepStage(models.TextChoices):
 
 #: HK sleep value string (``Record.value``) → compact stage.
 #:
-#: Values not in this map are not compacted: the router hands them back as
-#: leftovers, which go to ``Record`` (with a warning when
-#: ``save_records=False``).
+#: Use :func:`sleep_stage_for_value` rather than this map directly: it also
+#: maps unknown ``...Asleep*`` values to ``UNSPECIFIED``.  Values it cannot
+#: map are not compacted: the router hands them back as leftovers, which go
+#: to ``Record`` (with a warning when ``save_records=False``).
 HK_SLEEP_VALUE_TO_STAGE = {
     "HKCategoryValueSleepAnalysisAsleepUnspecified": SleepStage.UNSPECIFIED,
     # Android / Health Connect: the SLEEPING stage, and stage-less sessions
@@ -134,3 +135,26 @@ ASLEEP_STAGES = frozenset(
         SleepStage.REM,
     }
 )
+
+#: Prefix shared by every asleep HK sleep value.  The legacy read path counts
+#: any ``Record.value`` with this prefix as asleep.
+SLEEP_ASLEEP_VALUE_PREFIX = "HKCategoryValueSleepAnalysisAsleep"
+
+
+def sleep_stage_for_value(value: object) -> SleepStage | None:
+    """Map an HK sleep value string to a :class:`SleepStage`, or ``None``.
+
+    Known values use ``HK_SLEEP_VALUE_TO_STAGE``.  Any other value starting
+    with ``SLEEP_ASLEEP_VALUE_PREFIX`` maps to ``SleepStage.UNSPECIFIED``,
+    because the legacy read path counts every such value as asleep; without
+    this the compact path would never see it.  Anything else (aggregates
+    such as ``"100"``, unknown non-asleep values) returns ``None``.
+    """
+    stage = HK_SLEEP_VALUE_TO_STAGE.get(value)
+    if (
+        stage is None
+        and isinstance(value, str)
+        and value.startswith(SLEEP_ASLEEP_VALUE_PREFIX)
+    ):
+        return SleepStage.UNSPECIFIED
+    return stage
