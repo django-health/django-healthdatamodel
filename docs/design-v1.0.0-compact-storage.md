@@ -202,9 +202,15 @@ Routing rules per `RecordInput`:
    silently dropped; these types are rare and the 30-day archive policy bounds their
    cost. (Decision d3 below.)
 
-Write mechanics: `transaction.atomic()` + `select_for_update()` on the affected compact
-rows (no-op on SQLite, correct on Postgres), merge in Python, then
-`bulk_create(update_conflicts=True, unique_fields=…, update_fields=…)`. Per-customer
+Write mechanics: `transaction.atomic()` (the same one as the `Record` insert) +
+`select_for_update()` on the affected compact rows (no-op on SQLite, correct on
+Postgres), merge in Python, then
+`bulk_create(update_conflicts=True, unique_fields=…, update_fields=…)`. Keys that
+don't exist yet are first inserted as empty placeholders
+(`ON CONFLICT DO NOTHING`) so they can be locked too; otherwise two writers
+creating the same new key concurrently would both see "no row" and the later
+upsert would overwrite the earlier one. Placeholders are always overwritten in
+the same transaction. Per-customer
 uploads touch a handful of rows, so lock scope is tiny. Async variants mirror this via
 `sync_to_async`-free native async ORM calls where available.
 
@@ -320,6 +326,11 @@ Backfill implementation (`healthdatamodel/compat.py`):
 - **Migration check** already in CI catches drift. CI also runs `manage.py check`
   on the demo project, since `makemigrations --check` skips system checks: an
   over-long index name (models.E034) shipped once because of this.
+
+- **Consumer helpers** (v0.11 API): delete / reassign / restore are table-aware
+  (see [`UPGRADING-1.0.md`](UPGRADING-1.0.md#consumer-helpers-in-10)); the
+  `Record`-reading helpers stay on `Record` in 1.0 and require
+  `HEALTHDATAMODEL_SAVE_RECORDS = True`.
 
 Known differences between the two read paths that remain by design (rounding,
 grid alignment, tied-row representation, …) are listed in

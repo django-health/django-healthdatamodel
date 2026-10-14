@@ -38,7 +38,11 @@ Check each item before you start. If one fails, fix it first.
    Any hit bypasses the compact tables: compact reads won't see that data,
    and `verify_compact` will report it as a mismatch. Raw SQL and ETL jobs
    that write to the `healthdatamodel_record` table count as direct writes
-   too.
+   too. Deletes and account merges must go through
+   `customer_data.delete_records`, `delete_customer_health_data` and
+   `reassign_customer_health_data`, and archive restores through
+   `ingest.restore_records`: from 1.0 these keep the compact tables in
+   sync (see [Consumer helpers in 1.0](#consumer-helpers-in-10)).
 2. **Test fixtures build health data with `healthdatamodel.testing` and the
    ingest helpers**, not with `Record.objects.create`. Otherwise your test
    suite only exercises the legacy path, and when you flip reads in Step 6
@@ -54,6 +58,21 @@ Check each item before you start. If one fails, fix it first.
 5. **You have a recent database snapshot or backup**, and enough disk space.
    The compact tables are roughly 1–5 % of the size of `Record` for the same
    data.
+
+## Consumer helpers in 1.0
+
+The 0.11 helpers keep their signatures; from 1.0 they are table-aware:
+
+| Helper | 1.0 behaviour |
+|---|---|
+| `delete_records`, `delete_customer_health_data` | Also delete the customer's `SleepDay` / `ActivityDay` rows, in one transaction. `delete_customer_health_data` returns two extra keys, `sleep_days` and `activity_days`; `records=True` covers all three tables. |
+| `reassign_customer_health_data` | Moves the compact rows too. Where the target already has a row for the same key, the two are merged (newer upload wins, the older fills empty activity slots); then the target's compact rows are rebuilt from its merged `Record` rows with the backfill's replay rules. One transaction. **Requires `HEALTHDATAMODEL_SAVE_RECORDS = True`** (raises `ImproperlyConfigured` otherwise). |
+| `ingest.restore_records` | Also replays the restored sleep and activity rows into the compact tables (unless `SAVE_COMPACT` is off): an older restored upload never overwrites newer data, and repeating a restore leaves the compact tables unchanged. One transaction. |
+| `testing.create_record`, `create_records` | Go through `ingest_records`, so fixtures are written to both storage formats and visible in both read modes. |
+| `has_records`, `get_data_source_summary`, `query.get_sleep_records`, `query.infer_resolution_minutes`, `query.iter_records`, `query.iter_workouts` | Unchanged: they read `Record` / `Workout` whatever `READ_COMPACT` says. **They require `HEALTHDATAMODEL_SAVE_RECORDS = True`** and only see what your `Record` retention keeps. Compact implementations may follow in a later release. |
+
+So nothing in your code has to change for 1.0 if you already use the
+helpers, but keep `HEALTHDATAMODEL_SAVE_RECORDS = True` (Step 7).
 
 ## Step 1. Add the settings before bumping the pin
 
@@ -250,9 +269,11 @@ You are now at **stage B**.
    compared only on PostgreSQL. On other backends the line says
    `(sleep only)`.
 
-   The default tolerance (`--tolerance 0.2`) is per value, and covers the
-   0.1 kcal rounding (see below). Don't raise it to make a FAIL go away.
-   Investigate the mismatch first.
+   The default tolerance (`--tolerance 0.2`) applies to each activity value
+   and covers the 0.1 kcal rounding (see below); steps always allow at least
+   0.5, because they are stored as whole numbers. Sleep hours and wake
+   times are compared exactly. Don't raise the tolerance to make a FAIL go
+   away. Investigate the mismatch first.
 2. Run your **domain-level parity check** (Prerequisite 3) over the same
    customers and windows. It must match too.
 3. **If a customer mismatches**, the usual causes, in order of likelihood:
@@ -293,9 +314,12 @@ You are now at **stage C**.
 ## Step 7. What not to do
 
 - **Never set `HEALTHDATAMODEL_SAVE_RECORDS = False`** during 1.0.x. It
-  removes your rollback path. The legacy read path and `verify_compact` both
-  need `Record`, and some call sites may rely on `Record` for types the
-  compact schema doesn't model. A later release will cover turning it off.
+  removes your rollback path. The legacy read path, `verify_compact`,
+  `reassign_customer_health_data` and the `Record`-reading helpers
+  (`has_records`, `get_data_source_summary`, `get_sleep_records`,
+  `infer_resolution_minutes`, `iter_records`) all need `Record`, and some
+  call sites may rely on `Record` for types the compact schema doesn't
+  model. A later release will cover turning it off.
 - **Never set `HEALTHDATAMODEL_SAVE_COMPACT = False`** once you are past
   stage A. The compact tables go stale immediately. At stage C that means
   wrong reads.
@@ -310,9 +334,11 @@ You are now at **stage C**.
     covered yet. Pause it, or limit it to rows older than what you have
     decided to drop, until `compact_status` reports `pending: 0` for every
     customer. Otherwise that history is lost from the compact tables. You
-    can recover archived history by loading it and passing the rows (sorted
-    by `(customer_id, admin_create_date)`) to
-    `healthdatamodel.compat.replay_records`.
+    can recover archived history with `healthdatamodel.ingest.restore_records`
+    (writes `Record` and the compact tables; one customer or batch of
+    customers per call), or replay it into the compact tables only by
+    passing the rows, sorted by `(customer_id, admin_create_date, source)`,
+    to `healthdatamodel.compat.replay_records`.
   - Once reads are compact, a rollback to legacy reads only covers what is
     still in `Record`.
 - **Don't write to `Record` or the compact tables directly** (ORM, raw SQL,
@@ -328,7 +354,7 @@ up with normal uploads.
   The legacy path returns the raw value. Each stored value differs by at most
   0.05 kcal (or 0.5 steps), so a daily total built from 96 15-minute slots
   can drift a little more. `verify_compact` compares per value, with
-  `--tolerance 0.2` by default.
+  `--tolerance 0.2` by default and at least 0.5 for steps.
 - **Activity must sit on its own resolution grid to be compacted.** The
   record's duration must divide 1440 minutes evenly, and its start must be
   aligned to that grid within the UTC day: a 15-minute record must start at
