@@ -54,7 +54,7 @@ import logging
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timezone
 from typing import Any, NamedTuple
 
 from django.contrib.auth import get_user_model
@@ -260,3 +260,114 @@ def backfill_from_records(
         progress.customers,
     )
     return progress.result()
+
+
+# ---------------------------------------------------------------------------
+# Coverage (used by ``manage.py compact_status``)
+# ---------------------------------------------------------------------------
+
+
+class CoverageResult(NamedTuple):
+    customers_scanned: int
+    """Customers in scope (users table)."""
+    customers_with_records: int
+    """Of those, customers with compactable ``Record`` rows."""
+    pending: list[Any]
+    """Customer pks whose compact history does not yet reach back to their
+    oldest compactable ``Record`` day (i.e. not yet backfilled)."""
+    oldest_record_day: date | None
+    """Oldest compactable ``Record`` day among customers in scope."""
+
+
+def backfill_coverage(
+    customers: Iterable[Any] | None = None,
+    customer_range: tuple[Any, Any] | None = None,
+    customer_batch_size: int = 1000,
+) -> CoverageResult:
+    """Report which customers the backfill has not reached yet.
+
+    A customer counts as backfilled when, for sleep and for each activity
+    metric, their oldest compact day is on or before the day of their oldest
+    compactable ``Record`` row.  Live dual-writes only ever add *recent*
+    days, so a customer the backfill has not processed shows up as pending
+    even if they have been uploading since the upgrade.
+
+    Cheap on a large table: per customer it is a handful of correlated
+    ``ORDER BY ... LIMIT 1`` subqueries that PostgreSQL answers from the
+    ``(customer, type, startDate)`` / ``(customer, day)`` /
+    ``(customer, metric, day)`` indexes — no scan of ``Record``.
+
+    Caveat: a customer whose oldest row is uncompactable (an activity record
+    off the resolution grid, an unknown sleep value) stays pending even
+    after a backfill; ``verify_compact --customers <pk>`` tells whether the
+    reads actually differ.
+    """
+    from django.db.models import OuterRef, Subquery
+
+    from healthdatamodel.compact import sleep_day_for
+    from healthdatamodel.constants import HK_SLEEP_VALUE_TO_STAGE
+    from healthdatamodel.models import ActivityDay, SleepDay
+
+    def first_record(record_type: str, **extra: Any) -> Subquery:
+        return Subquery(
+            Record.objects.filter(customer=OuterRef("pk"), type=record_type, **extra)
+            .order_by("startDate")
+            .values("startDate")[:1]
+        )
+
+    annotations: dict[str, Subquery] = {
+        "rec_sleep": first_record(SLEEP_TYPE, value__in=list(HK_SLEEP_VALUE_TO_STAGE)),
+        "cmp_sleep": Subquery(
+            SleepDay.objects.filter(customer=OuterRef("pk"))
+            .order_by("day")
+            .values("day")[:1]
+        ),
+    }
+    metrics = list(HK_TYPE_TO_COMPACT_METRIC.items())
+    for i, (hk_type, metric) in enumerate(metrics):
+        annotations[f"rec_{i}"] = first_record(hk_type)
+        annotations[f"cmp_{i}"] = Subquery(
+            ActivityDay.objects.filter(customer=OuterRef("pk"), metric=metric.value)
+            .order_by("day")
+            .values("day")[:1]
+        )
+
+    def to_utc(value: Any) -> Any:
+        return value.astimezone(timezone.utc) if value is not None else None
+
+    scanned = 0
+    with_records = 0
+    pending: list[Any] = []
+    oldest: date | None = None
+    names = list(annotations)
+    for batch in _customer_batches(customers, customer_range, customer_batch_size):
+        scanned += len(batch)
+        rows = (
+            get_user_model()
+            .objects.filter(pk__in=batch)
+            .order_by("pk")
+            .annotate(**annotations)
+            .values_list("pk", *names)
+        )
+        for pk, *values in rows:
+            row = dict(zip(names, values))
+            pairs: list[tuple[date | None, date | None]] = [
+                (
+                    sleep_day_for(row["rec_sleep"]) if row["rec_sleep"] else None,
+                    row["cmp_sleep"],
+                )
+            ]
+            for i in range(len(metrics)):
+                rec = to_utc(row[f"rec_{i}"])
+                pairs.append((rec.date() if rec else None, row[f"cmp_{i}"]))
+            record_days = [rec for rec, _ in pairs if rec is not None]
+            if not record_days:
+                continue
+            with_records += 1
+            first = min(record_days)
+            oldest = first if oldest is None else min(oldest, first)
+            if any(
+                rec is not None and (cmp is None or cmp > rec) for rec, cmp in pairs
+            ):
+                pending.append(pk)
+    return CoverageResult(scanned, with_records, pending, oldest)
