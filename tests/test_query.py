@@ -3,7 +3,9 @@ Tests for healthdatamodel.query.
 
 Every test in this module runs twice — once against the compact read path
 (SleepDay / ActivityDay) and once against the legacy Record path — via the
-autouse ``read_mode`` fixture.  Data is created through ``ingest_records``
+autouse ``read_mode`` fixture, which sets ``HEALTHDATAMODEL_READ_COMPACT``
+explicitly for both parametrisations (nothing here relies on the package
+default, which is ``False``).  Data is created through ``ingest_records``
 (which dual-writes to both storage formats), so this module doubles as the
 compact/legacy parity suite.
 

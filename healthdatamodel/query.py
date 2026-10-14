@@ -23,9 +23,19 @@ The sleep functions return values keyed by every day in the requested range:
 :func:`get_sleep_by_day` additionally carries the wake time (end of the last
 sleep interval, capped at the day boundary, not rounded).
 
-:func:`get_activity_records` and :func:`get_activity_by_day` require
-PostgreSQL (window-function CTEs for source-ranked deduplication).
-Sleep functions work with any Django-supported backend.
+Read paths
+----------
+Every public function dispatches on ``settings.HEALTHDATAMODEL_READ_COMPACT``:
+
+* ``False`` (**the default**) — the legacy path over ``Record``.
+  :func:`get_activity_records` / :func:`get_activity_by_day` then require
+  PostgreSQL (window-function CTEs for source-ranked deduplication).
+* ``True`` — the compact path over ``SleepDay`` / ``ActivityDay``; works on
+  any backend.  Only switch once the compact tables are backfilled and
+  verified (``manage.py compact_status`` / ``verify_compact``; see
+  ``docs/UPGRADING-1.0.md``).
+
+Sleep functions work with any Django-supported backend in both modes.
 
 Record-level readers
 --------------------
@@ -578,7 +588,9 @@ def get_activity_records(
     already present.
 
     .. note::
-        This function requires PostgreSQL.
+        The legacy read path (``HEALTHDATAMODEL_READ_COMPACT = False``,
+        the default) requires PostgreSQL; the compact path works on any
+        backend.
 
     Parameters
     ----------
@@ -747,7 +759,9 @@ def get_activity_by_day(
     Delegates to :func:`get_activity_records` with ``resolution_minutes=1440``.
 
     .. note::
-        This function requires PostgreSQL.
+        The legacy read path (``HEALTHDATAMODEL_READ_COMPACT = False``,
+        the default) requires PostgreSQL; the compact path works on any
+        backend.
 
     Parameters
     ----------

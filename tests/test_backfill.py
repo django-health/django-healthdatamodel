@@ -47,6 +47,12 @@ def legacy_only(settings):
     settings.HEALTHDATAMODEL_SAVE_COMPACT = True
 
 
+@pytest.fixture
+def compact_reads(settings):
+    """Read through the compact tables (the 1.0 default is the legacy path)."""
+    settings.HEALTHDATAMODEL_READ_COMPACT = True
+
+
 def _ingest_night(customer, start, end, admin_create_date, sourceName="apple"):
     ingest_records(
         customer,
@@ -103,7 +109,9 @@ class TestBackfill:
         assert SleepDay.objects.count() == 1
         assert ActivityDay.objects.count() == 1
 
-    def test_android_sleep_values_backfilled(self, customer, legacy_only):
+    def test_android_sleep_values_backfilled(
+        self, customer, legacy_only, compact_reads
+    ):
         ingest_records(
             customer,
             [
@@ -138,7 +146,9 @@ class TestBackfill:
         assert len(row.intervals) == 2
         assert get_sleep_hours_by_day(customer, TODAY, TODAY)[TODAY] == 4.0
 
-    def test_replay_order_newest_upload_wins(self, customer, legacy_only):
+    def test_replay_order_newest_upload_wins(
+        self, customer, legacy_only, compact_reads
+    ):
         # Older upload has the longer night; newer upload replaces it.
         _ingest_night(
             customer,

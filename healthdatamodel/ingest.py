@@ -40,7 +40,9 @@ All ingest functions also write to the compact tables
 defaulting to ``settings.HEALTHDATAMODEL_SAVE_RECORDS`` (``True``).
 Records the compact schema cannot represent (unknown types, non-grid
 intervals) are written to ``Record`` even when ``save_records`` is off, so
-nothing is ever silently dropped.
+nothing is ever silently dropped.  Which table the *query* API reads from is
+a separate switch, ``settings.HEALTHDATAMODEL_READ_COMPACT`` (default
+``False``: legacy reads), see :mod:`healthdatamodel.query`.
 """
 
 from __future__ import annotations

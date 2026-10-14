@@ -62,18 +62,52 @@ _ActivityGroups = dict[tuple[str, str, int, date], dict[int, float]]
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
+#
+# The defaults are chosen so that a consumer who sets *nothing* gets the
+# safe, reversible state: the 1.0 migrations create the compact tables (DDL
+# only), every upload is dual-written to both ``Record`` and the compact
+# tables, and reads keep using the legacy ``Record`` path.  Switching reads
+# over, and seeding the compact tables from history, are explicit opt-ins —
+# see ``docs/UPGRADING-1.0.md``.
+
+#: setting name -> default.  Single source of truth for the helpers below and
+#: for ``manage.py compact_status``.
+SETTINGS_DEFAULTS: dict[str, bool] = {
+    # Write-through to the legacy Record log.
+    "HEALTHDATAMODEL_SAVE_RECORDS": True,
+    # Write to SleepDay / ActivityDay.
+    "HEALTHDATAMODEL_SAVE_COMPACT": True,
+    # Serve the query API from SleepDay / ActivityDay instead of Record.
+    "HEALTHDATAMODEL_READ_COMPACT": False,
+    # Let the 0012 data migration seed the compact tables from Record.
+    # Only for small installs: it runs inside the migration transaction.
+    "HEALTHDATAMODEL_BACKFILL_IN_MIGRATION": False,
+}
+
+
+def _setting(name: str) -> bool:
+    return bool(getattr(django_settings, name, SETTINGS_DEFAULTS[name]))
+
+
+def effective_settings() -> dict[str, bool]:
+    """Return every compact-storage setting with its effective value."""
+    return {name: _setting(name) for name in SETTINGS_DEFAULTS}
 
 
 def save_records_enabled() -> bool:
-    return getattr(django_settings, "HEALTHDATAMODEL_SAVE_RECORDS", True)
+    return _setting("HEALTHDATAMODEL_SAVE_RECORDS")
 
 
 def save_compact_enabled() -> bool:
-    return getattr(django_settings, "HEALTHDATAMODEL_SAVE_COMPACT", True)
+    return _setting("HEALTHDATAMODEL_SAVE_COMPACT")
 
 
 def read_compact_enabled() -> bool:
-    return getattr(django_settings, "HEALTHDATAMODEL_READ_COMPACT", True)
+    return _setting("HEALTHDATAMODEL_READ_COMPACT")
+
+
+def backfill_in_migration_enabled() -> bool:
+    return _setting("HEALTHDATAMODEL_BACKFILL_IN_MIGRATION")
 
 
 # ---------------------------------------------------------------------------
