@@ -8,6 +8,16 @@ Sleep
 -----
 - :func:`get_sleep_hours_by_day` — total hours per day (simple form)
 - :func:`get_sleep_by_day`       — hours *and* wake time per day
+- :func:`get_sleep_intervals_by_day` — every stage interval of the chosen
+  device per day (:class:`SleepInterval`)
+- :func:`get_sleep_summary_by_day` — sleep start/end, efficiency,
+  awakenings, naps per day (:class:`DailySleepSummary`)
+- :func:`get_sleep_regularity_index` — Sleep Regularity Index / consistency
+  over the last few days (:class:`SleepRegularity`)
+
+The pure calculations behind the last two live in :mod:`healthdatamodel.sleep`
+(:func:`summarize_sleep_intervals`, :func:`sleep_regularity_from_intervals`)
+and are re-exported here.
 
 Activity
 --------
@@ -68,7 +78,7 @@ from __future__ import annotations
 import sys
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Any, Literal, NamedTuple
 
 if sys.version_info >= (3, 11):
@@ -90,9 +100,11 @@ from healthdatamodel.constants import (
     ASLEEP_STAGES,
     HK_TYPE_TO_COMPACT_METRIC,
     MINUTES_PER_DAY,
+    SLEEP_ASLEEP_VALUE_PREFIX,
     SLEEP_TYPE,
     ConnectionStatus,
     DataSource,
+    sleep_stage_for_value,
 )
 from healthdatamodel.models import (
     ActivityDay,
@@ -103,6 +115,13 @@ from healthdatamodel.models import (
     Workout,
 )
 from healthdatamodel.schemas import StoredRecord, StoredWorkout
+from healthdatamodel.sleep import (
+    DailySleepSummary,
+    SleepInterval,
+    SleepRegularity,
+    sleep_regularity_from_intervals,
+    summarize_sleep_intervals,
+)
 
 _DEFAULT_SLEEP_DEVICE_SORT_ORDER = ["oura", "whoop", "apple", "garmin"]
 
@@ -141,7 +160,7 @@ class SleepValue(StrEnum):
 
 # SLEEP_TYPE is defined in constants and re-exported here for compatibility.
 _SLEEP_TYPE = SLEEP_TYPE
-_SLEEP_VALUE_PREFIX = "HKCategoryValueSleepAnalysisAsleep"
+_SLEEP_VALUE_PREFIX = SLEEP_ASLEEP_VALUE_PREFIX
 
 
 class ActivityMetric(StrEnum):
@@ -210,72 +229,87 @@ def _rank_sleep_devices(customer: Any, devices: list[str]) -> list[str]:
     )
 
 
-def _sleep_for_day(customer: Any, day: date, boundary_hour: int) -> DailySleep:
+class _SleepSelection(NamedTuple):
+    """The upload + device chosen for one sleep-day window.
+
+    ``intervals`` holds every stage interval (unclipped, deduplicated) of
+    that device and upload which overlaps ``[window_start, window_end)``.
+    Shared by :func:`get_sleep_by_day` and :func:`get_sleep_intervals_by_day`
+    so the two can never choose differently.
+    """
+
+    device: str
+    window_start: datetime
+    window_end: datetime
+    intervals: list[tuple[datetime, datetime, str]]
+
+
+def _select_sleep_legacy(
+    customer: Any, day: date, boundary_hour: int
+) -> _SleepSelection | None:
+    """Legacy (``Record``) selection: latest upload among asleep records
+    overlapping the window, then the best-ranked device of that upload."""
     start_time, end_time = _day_window(day, boundary_hour)
+    overlaps_window = (
+        Q(startDate__lt=end_time, startDate__gte=start_time)
+        | Q(endDate__gt=start_time, endDate__lte=end_time)
+        | Q(startDate__lt=start_time, endDate__gt=end_time)  # spans entire window
+    )
 
     sleep_qs = Record.objects.filter(
         customer=customer,
         type=_SLEEP_TYPE,
         value__startswith=_SLEEP_VALUE_PREFIX,
-    ).filter(
-        Q(startDate__lt=end_time, startDate__gte=start_time)
-        | Q(endDate__gt=start_time, endDate__lte=end_time)
-        | Q(
-            startDate__lt=start_time, endDate__gt=end_time
-        )  # record spans entire window
-    )
+    ).filter(overlaps_window)
 
     most_recent = sleep_qs.order_by("admin_create_date").last()
     if most_recent is None:
-        return DailySleep(hours=None, wake_time=None)
+        return None
 
     upload_dt = most_recent.admin_create_date
-    devices = list(
+    # Sorted like the compact path, so devices that tie in the ranking
+    # (e.g. names differing only in case) resolve the same way in both
+    # read modes instead of depending on database row order.
+    devices = sorted(
         sleep_qs.filter(admin_create_date=upload_dt)
         .values_list("sourceName", flat=True)
         .distinct()
     )
-    devices = _rank_sleep_devices(customer, devices)
+    device = _rank_sleep_devices(customer, devices)[0]
 
-    records_for_device = sleep_qs.filter(
-        admin_create_date=upload_dt, sourceName=devices[0]
-    )
-    pairs = {(r.startDate, r.endDate) for r in records_for_device}
-    minutes = int(
-        sum(
-            (min(end, end_time) - max(start, start_time)).total_seconds()
-            for start, end in pairs
+    # Every stage of the chosen device and upload, not just asleep ones.
+    records = (
+        Record.objects.filter(
+            customer=customer,
+            type=_SLEEP_TYPE,
+            admin_create_date=upload_dt,
+            sourceName=device,
         )
-        // 60
+        .filter(overlaps_window)
+        .values_list("startDate", "endDate", "value")
     )
-    wake_time = min(max(end for _, end in pairs), end_time)
-    return DailySleep(hours=minutes / 60.0, wake_time=wake_time)
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers — compact read paths
-# ---------------------------------------------------------------------------
+    intervals = set()
+    for record_start, record_end, value in records:
+        stage = sleep_stage_for_value(value)
+        if stage is not None:
+            intervals.add((record_start, record_end, str(stage.value)))
+    return _SleepSelection(device, start_time, end_time, sorted(intervals))
 
 
 def _parse_sleep_intervals(
     row_intervals: list[Any],
-) -> list[tuple[datetime, datetime]]:
-    """Parse a SleepDay ``intervals`` JSON list into asleep (start, end) pairs."""
-    pairs = []
-    for entry in row_intervals:
-        start_iso, end_iso, stage = entry
-        if stage not in ASLEEP_STAGES:
-            continue
-        pairs.append(
-            (datetime.fromisoformat(start_iso), datetime.fromisoformat(end_iso))
-        )
-    return pairs
+) -> list[tuple[datetime, datetime, str]]:
+    """Parse a SleepDay ``intervals`` JSON list into (start, end, stage)."""
+    return [
+        (datetime.fromisoformat(start_iso), datetime.fromisoformat(end_iso), stage)
+        for start_iso, end_iso, stage in row_intervals
+    ]
 
 
-def _get_sleep_by_day_compact(
+def _select_sleep_compact(
     customer: Any, start: date, end: date, boundary_hour: int
-) -> dict[date, DailySleep]:
-    """Compact-table implementation of :func:`get_sleep_by_day`.
+) -> dict[date, _SleepSelection | None]:
+    """Compact-table (``SleepDay``) selection for every day in the range.
 
     Stored rows are canonicalised to the 14:00 UTC boundary; because their
     interval pieces exactly tile the original records, any requested
@@ -291,53 +325,118 @@ def _get_sleep_by_day_compact(
     )
     parsed = [(row, _parse_sleep_intervals(row.intervals)) for row in rows]
 
-    results: dict[date, DailySleep] = {}
+    results: dict[date, _SleepSelection | None] = {}
     for i in range((end - start).days + 1):
         day = start + timedelta(days=i)
         window_start, window_end = _day_window(day, boundary_hour)
 
-        # Candidate rows: any asleep interval strictly overlapping the window.
-        candidates = []
-        for row, intervals in parsed:
-            overlapping = [
-                (s, e)
-                for s, e in intervals
+        def overlapping(
+            intervals: list[tuple[datetime, datetime, str]],
+            window_start: datetime = window_start,
+            window_end: datetime = window_end,
+        ) -> list[tuple[datetime, datetime, str]]:
+            return [
+                (s, e, stage)
+                for s, e, stage in intervals
                 if max(s, window_start) < min(e, window_end)
             ]
-            if overlapping:
-                candidates.append((row, overlapping))
 
+        # Candidate rows: any asleep interval strictly overlapping the window.
+        candidates = [
+            row
+            for row, intervals in parsed
+            if any(stage in ASLEEP_STAGES for _, _, stage in overlapping(intervals))
+        ]
         if not candidates:
-            results[day] = DailySleep(hours=None, wake_time=None)
+            results[day] = None
             continue
 
         # Latest upload wins, mirroring the legacy per-window behaviour.
-        upload_dt = max(row.admin_create_date for row, _ in candidates)
-        current = [
-            (row, intervals)
-            for row, intervals in candidates
-            if row.admin_create_date == upload_dt
-        ]
+        upload_dt = max(row.admin_create_date for row in candidates)
         devices = _rank_sleep_devices(
-            customer, sorted({row.device for row, _ in current})
+            customer,
+            sorted(
+                {row.device for row in candidates if row.admin_create_date == upload_dt}
+            ),
         )
-        chosen = devices[0]
-        pairs = {
-            (s, e)
-            for row, intervals in current
-            if row.device == chosen
-            for s, e in intervals
+        device = devices[0]
+        chosen = {
+            entry
+            for row, intervals in parsed
+            if row.admin_create_date == upload_dt and row.device == device
+            for entry in overlapping(intervals)
         }
-        minutes = int(
-            sum(
-                (min(e, window_end) - max(s, window_start)).total_seconds()
-                for s, e in pairs
-            )
-            // 60
-        )
-        wake_time = min(max(e for _, e in pairs), window_end)
-        results[day] = DailySleep(hours=minutes / 60.0, wake_time=wake_time)
+        results[day] = _SleepSelection(device, window_start, window_end, sorted(chosen))
     return results
+
+
+def _select_sleep(
+    customer: Any, start: date, end: date, boundary_hour: int
+) -> dict[date, _SleepSelection | None]:
+    """Per-day upload/device selection, dispatching on the read mode."""
+    if read_compact_enabled():
+        return _select_sleep_compact(customer, start, end, boundary_hour)
+    return {
+        start + timedelta(days=i): _select_sleep_legacy(
+            customer, start + timedelta(days=i), boundary_hour
+        )
+        for i in range((end - start).days + 1)
+    }
+
+
+def _daily_sleep(selection: _SleepSelection | None) -> DailySleep:
+    """Hours + wake time from a selection (the :func:`get_sleep_by_day` math).
+
+    Asleep pairs are deduplicated by ``(start, end)`` and summed without
+    merging overlaps, exactly as before the selection refactor.
+    """
+    if selection is None:
+        return DailySleep(hours=None, wake_time=None)
+    window_start, window_end = selection.window_start, selection.window_end
+    pairs = {(s, e) for s, e, stage in selection.intervals if stage in ASLEEP_STAGES}
+    minutes = int(
+        sum(
+            (min(e, window_end) - max(s, window_start)).total_seconds()
+            for s, e in pairs
+        )
+        // 60
+    )
+    wake_time = min(max(e for _, e in pairs), window_end)
+    return DailySleep(hours=minutes / 60.0, wake_time=wake_time)
+
+
+def _clipped_intervals(selection: _SleepSelection | None) -> list[SleepInterval]:
+    """All stages of a selection clipped to its window, sorted by start.
+
+    Intervals of the same stage that overlap or touch are merged.  The
+    compact tables store a record crossing the canonical 14:00 UTC boundary
+    as two pieces, so without this a ``day_boundary_hour`` other than 14
+    would return one interval in legacy mode and two in compact mode; the
+    per-stage union is the same in both.
+    """
+    if selection is None:
+        return []
+    by_stage: dict[str, list[tuple[datetime, datetime]]] = defaultdict(list)
+    for s, e, stage in selection.intervals:
+        s, e = max(s, selection.window_start), min(e, selection.window_end)
+        if s < e:
+            by_stage[stage].append((s, e))
+    merged: list[tuple[datetime, datetime, str]] = []
+    for stage, spans in by_stage.items():
+        current: tuple[datetime, datetime] | None = None
+        for s, e in sorted(spans):
+            if current is not None and s <= current[1]:
+                current = (current[0], max(current[1], e))
+                continue
+            if current is not None:
+                merged.append((*current, stage))
+            current = (s, e)
+        if current is not None:
+            merged.append((*current, stage))
+    return [
+        SleepInterval(start=s, end=e, stage=stage, device=selection.device)
+        for s, e, stage in sorted(merged)
+    ]
 
 
 def _active_data_source(customer: Any) -> str:
@@ -520,13 +619,11 @@ def get_sleep_by_day(
         * ``wake_time`` — end of last sleep interval capped at day boundary,
           or ``None`` if no records.  Not rounded.
     """
-    if read_compact_enabled():
-        return _get_sleep_by_day_compact(customer, start, end, day_boundary_hour)
     return {
-        start + timedelta(days=i): _sleep_for_day(
-            customer, start + timedelta(days=i), day_boundary_hour
-        )
-        for i in range((end - start).days + 1)
+        day: _daily_sleep(selection)
+        for day, selection in _select_sleep(
+            customer, start, end, day_boundary_hour
+        ).items()
     }
 
 
@@ -566,6 +663,120 @@ def get_sleep_hours_by_day(
             customer, start, end, day_boundary_hour
         ).items()
     }
+
+
+def get_sleep_intervals_by_day(
+    customer: Any,
+    start: date,
+    end: date,
+    day_boundary_hour: int = 14,
+) -> dict[date, list[SleepInterval]]:
+    """
+    Return every stage interval of each night's chosen device and upload.
+
+    The upload and device are chosen exactly as in :func:`get_sleep_by_day`
+    (same internal routine): the latest ``admin_create_date`` among asleep
+    records overlapping the window, then the device ranking.  All stages of
+    that device and upload (asleep stages, ``awake``, ``in_bed``) are
+    returned, clipped to the window and sorted by start.  Intervals of the
+    same stage that overlap or touch are merged into one, so the result is
+    identical in both read modes (the compact tables store a record that
+    crosses 14:00 UTC as two pieces).
+
+    Parameters
+    ----------
+    customer:
+        Any ``settings.AUTH_USER_MODEL`` instance.
+    start, end:
+        Day range (inclusive).
+    day_boundary_hour:
+        UTC hour that marks the end of each sleep day (default 14 → 2 pm).
+
+    Returns
+    -------
+    dict[date, list[SleepInterval]]
+        One key per day in the range; an empty list when the night has no
+        asleep records.
+    """
+    return {
+        day: _clipped_intervals(selection)
+        for day, selection in _select_sleep(
+            customer, start, end, day_boundary_hour
+        ).items()
+    }
+
+
+def get_sleep_summary_by_day(
+    customer: Any,
+    start: date,
+    end: date,
+    day_boundary_hour: int = 14,
+    tz: tzinfo | None = None,
+    main_sleep_gap_minutes: int = 120,
+) -> dict[date, DailySleepSummary]:
+    """
+    Return a :class:`DailySleepSummary` for each day in ``[start, end]``.
+
+    Runs :func:`~healthdatamodel.sleep.summarize_sleep_intervals` on the
+    output of :func:`get_sleep_intervals_by_day`; see that function for the
+    definitions of main sleep, time in bed, efficiency, awakenings and naps.
+
+    Parameters
+    ----------
+    tz:
+        Time zone for ``sleep_start`` / ``sleep_end`` (default UTC).  Only
+        the presentation changes; the day windows stay in UTC.  For
+        consumers that store true UTC.  If you store local wall-clock time
+        labelled UTC, leave it ``None``: the values are then already local
+        (and the 14:00 "UTC" boundary is 14:00 local).
+    main_sleep_gap_minutes:
+        Gap (minutes) that splits the night into separate sessions.
+
+    Returns
+    -------
+    dict[date, DailySleepSummary]
+        Every numeric field is ``None`` for days without asleep records.
+    """
+    results = {}
+    for day, intervals in get_sleep_intervals_by_day(
+        customer, start, end, day_boundary_hour
+    ).items():
+        window_start, window_end = _day_window(day, day_boundary_hour)
+        results[day] = summarize_sleep_intervals(
+            intervals,
+            window_start,
+            window_end,
+            main_sleep_gap_minutes=main_sleep_gap_minutes,
+            tz=tz,
+        )
+    return results
+
+
+def get_sleep_regularity_index(
+    customer: Any,
+    end_day: date,
+    days: int = 4,
+    day_boundary_hour: int = 14,
+) -> SleepRegularity:
+    """
+    Sleep Regularity Index over the *days* sleep days ending at *end_day*.
+
+    Fetches the asleep intervals of each night's chosen device via
+    :func:`get_sleep_intervals_by_day` and applies
+    :func:`~healthdatamodel.sleep.sleep_regularity_from_intervals` (Phillips
+    et al. 2017; WHOOP-style 4-day consistency).  Nights without records are
+    excluded rather than counted as awake.  ``days`` must be ≥ 2; with the
+    default of 4 at most ``3 × 1440`` minute pairs are compared.  ``sri`` is
+    ``None`` when fewer than two nights have data or no pairs exist.
+    """
+    if days < 2:
+        raise ValueError("days must be at least 2")
+    intervals = get_sleep_intervals_by_day(
+        customer, end_day - timedelta(days=days - 1), end_day, day_boundary_hour
+    )
+    return sleep_regularity_from_intervals(
+        intervals, end_day, days=days, day_boundary_hour=day_boundary_hour
+    )
 
 
 # ---------------------------------------------------------------------------

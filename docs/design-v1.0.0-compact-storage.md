@@ -299,7 +299,9 @@ Backfill implementation (`healthdatamodel/compat.py`):
    ([`UPGRADING-1.0.md`](UPGRADING-1.0.md)).
 2. Production runs on compact reads, with `Record` still written, for at least a full
    archive cycle (30 days), so that `Record` holds nothing the compact tables don't.
-3. **v1.1.0** — `HEALTHDATAMODEL_SAVE_RECORDS` default flips to `False` (documented in
+3. **A later release** (planned for v1.1.0 originally; 1.1.0 shipped the sleep
+   summary API instead, see [`design-v1.1.0-sleep-metrics.md`](design-v1.1.0-sleep-metrics.md))
+   — `HEALTHDATAMODEL_SAVE_RECORDS` default flips to `False` (documented in
    changelog; consumers who still want the log pin it `True`). `Record` drains via the
    existing archive job.
 4. **v2.0.0** — legacy read path (`READ_COMPACT=False` branch) removed; `Record` kept

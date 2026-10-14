@@ -258,10 +258,11 @@ You are now at **stage B**.
    verify_compact: 200 customer(s), 2026-09-15..2026-10-14 (30 days), tolerance 0.2
      check                           days  with data  mismatched
      sleep                           6000       4120           0
+     sleep_stages                    6000       4120           0
      ACTIVE_CALORIES@15min           6000       3980           0
      ACTIVE_CALORIES@1440min         6000          0           0
      ...
-   PASS: compact and legacy reads agree on all 42000 customer-day checks.
+   PASS: compact and legacy reads agree on all 48000 customer-day checks.
    ```
 
    The exit code is 0. Any mismatch prints `MISMATCH ...` lines (up to
@@ -272,7 +273,8 @@ You are now at **stage B**.
    The default tolerance (`--tolerance 0.2`) applies to each activity value
    and covers the 0.1 kcal rounding (see below); steps always allow at least
    0.5, because they are stored as whole numbers. Sleep hours and wake
-   times are compared exactly. Don't raise the tolerance to make a FAIL go
+   times are compared exactly, and so (from 1.1.0, row `sleep_stages`) is
+   every stage interval `get_sleep_intervals_by_day` returns. Don't raise the tolerance to make a FAIL go
    away. Investigate the mismatch first.
 2. Run your **domain-level parity check** (Prerequisite 3) over the same
    customers and windows. It must match too.

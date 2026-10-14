@@ -67,6 +67,9 @@ from healthdatamodel.query import (
     has_competing_sources,
     get_sleep_hours_by_day,
     get_sleep_by_day,
+    get_sleep_intervals_by_day,
+    get_sleep_summary_by_day,
+    get_sleep_regularity_index,
     get_activity_by_day,
     get_activity_records,
 )
@@ -116,6 +119,93 @@ The day boundary defaults to **14:00 UTC** (2 pm), giving a window of 2 pm the p
 Device preference is read from `WearableConnection`. When multiple sleep sources are present, the `preferred_for_sleep` device wins; the default fallback order is `oura → whoop → apple → garmin`.
 
 Sleep functions work with any Django-supported backend (SQLite, PostgreSQL, etc.) in both read modes. The compact tables store sleep at the canonical 2 pm boundary, but the stored interval pieces tile the original records exactly, so they can still serve any `day_boundary_hour`.
+
+### Sleep summary and regularity (v1.1)
+
+Per-night details (sleep start and wake time, efficiency, awakenings, naps)
+and a WHOOP-style sleep consistency score, all built on the same upload and
+device choice as `get_sleep_by_day` (so the numbers always describe the same
+night of the same device).
+
+```python
+from datetime import date, timezone
+from zoneinfo import ZoneInfo
+from healthdatamodel.query import (
+    get_sleep_intervals_by_day,
+    get_sleep_summary_by_day,
+    get_sleep_regularity_index,
+)
+
+# Every stage of the chosen device, clipped to the night window, sorted;
+# overlapping or touching intervals of the same stage are merged
+get_sleep_intervals_by_day(customer, date(2025, 6, 1), date(2025, 6, 7))
+# {date: [SleepInterval(start, end, stage="core", device="Apple Watch"), ...], ...}
+# []  → no sleep records that night
+
+get_sleep_summary_by_day(
+    customer, date(2025, 6, 1), date(2025, 6, 7), tz=ZoneInfo("America/New_York")
+)
+# {date: DailySleepSummary(
+#     sleep_start=datetime(2025, 5, 31, 23, 5, tzinfo=New_York),
+#     sleep_end=datetime(2025, 6, 1, 6, 50, tzinfo=New_York),
+#     asleep_minutes=430, in_bed_minutes=465, awake_minutes=35,
+#     efficiency=0.925, awakenings=2, nap_minutes=0,
+#     device="Apple Watch", has_in_bed_data=False), ...}
+
+get_sleep_regularity_index(customer, end_day=date(2025, 6, 7))  # last 4 nights
+# SleepRegularity(sri=81.3, consistency_pct=90.65, days_with_data=4,
+#                 minutes_compared=4320)
+```
+
+**Time zones.** Sleep days run from `day_boundary_hour` to
+`day_boundary_hour` in the stored clock ("UTC"). If, like the main consumer,
+you store local wall-clock time labelled UTC, the default boundary is really
+2 pm local and `sleep_start` / `sleep_end` are already local: leave `tz`
+unset. `tz` is for installs that store true UTC; it only converts
+`sleep_start` / `sleep_end` for display and does not move the day windows.
+
+What each summary field means:
+
+- **Main sleep.** All intervals of the night (any stage) are grouped into
+  sessions; a gap of more than `main_sleep_gap_minutes` (default 120) starts
+  a new session. The main sleep is the session with the most minutes asleep
+  (on a tie, the later one). `sleep_start` / `sleep_end` are the first asleep
+  start and last asleep end in it, in `tz` (default UTC).
+- **`asleep_minutes`** — time in asleep stages (core, deep, REM, unspecified)
+  in the main sleep, with overlaps counted once.
+- **`in_bed_minutes`** — if the device sends `in_bed` intervals (Google
+  Health, Health Connect), their union within the main sleep, stretched to
+  cover `sleep_start`–`sleep_end` if needed (`has_in_bed_data=True`).
+  Otherwise (Apple Health, which sends asleep stages only) it is inferred as
+  `sleep_start`–`sleep_end`.
+- **`awake_minutes`** = `in_bed_minutes − asleep_minutes`.
+- **`efficiency`** = `asleep_minutes / in_bed_minutes`, between 0 and 1.
+- **`awakenings`** — the number of breaks of at least one minute in asleep
+  time between `sleep_start` and `sleep_end`. An explicit awake / out-of-bed
+  interval and a plain gap between Apple stages count the same.
+- **`nap_minutes`** — asleep time in the other sessions (e.g. an afternoon
+  nap inside the 2 pm–2 pm window).
+
+Minutes are whole minutes, rounded down. A night with no asleep records
+returns `None` in every numeric field (and `sleep_start` / `sleep_end`);
+`has_in_bed_data` is then `False`. A single stage-less Android
+`...Asleep` block gives efficiency 1.0 and zero awakenings.
+
+**Sleep Regularity Index.** `get_sleep_regularity_index` implements the Sleep
+Regularity Index of Phillips et al. (2017), the basis of WHOOP's sleep
+consistency: over the `days` nights ending at `end_day` (default 4, minimum
+2) each minute is marked asleep or awake, and the SRI is the share of minutes
+whose state matches the same minute 24 hours later, scaled to −100…100
+(`SRI = −100 + 200 × matches / pairs`). `consistency_pct = (SRI + 100) / 2`
+puts it on 0–100. With 4 nights at most 3 × 1440 = 4320 minute pairs are
+compared. A night with no records is left out (its minutes are not counted as
+awake); `sri` and `consistency_pct` are `None` when fewer than two nights have
+data or no two consecutive nights do (`minutes_compared == 0`).
+
+The calculations are pure functions in `healthdatamodel.sleep`
+(`summarize_sleep_intervals`, `sleep_regularity_from_intervals`) and can run
+on in-memory intervals without the database. See
+[docs/design-v1.1.0-sleep-metrics.md](docs/design-v1.1.0-sleep-metrics.md).
 
 ### Activity
 
@@ -439,7 +529,7 @@ and verification.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `HEALTHDATAMODEL_SAVE_RECORDS` | `True` | Write every upload through to the legacy `Record` log. This is the rollback path, so keep it on throughout 1.0.x. `reassign_customer_health_data` and the `Record`-reading helpers (`has_records`, `get_data_source_summary`, `get_sleep_records`, `infer_resolution_minutes`, `iter_records`) depend on it. Per-call override: `ingest_records(..., save_records=...)`. |
+| `HEALTHDATAMODEL_SAVE_RECORDS` | `True` | Write every upload through to the legacy `Record` log. This is the rollback path, so keep it on throughout 1.0.x (1.1.0 does not change this default). `reassign_customer_health_data` and the `Record`-reading helpers (`has_records`, `get_data_source_summary`, `get_sleep_records`, `infer_resolution_minutes`, `iter_records`) depend on it. Per-call override: `ingest_records(..., save_records=...)`. |
 | `HEALTHDATAMODEL_SAVE_COMPACT` | `True` | Write every upload to `SleepDay` / `ActivityDay`. |
 | `HEALTHDATAMODEL_READ_COMPACT` | `False` | Serve the query API from the compact tables. Set it to `True` per environment once `compact_status` and `verify_compact` pass. Setting it back to `False` rolls back with no data loss. The legacy path needs PostgreSQL for activity reads. |
 | `HEALTHDATAMODEL_BACKFILL_IN_MIGRATION` | `False` | Let migration `0012` seed the compact tables from `Record` inside the migration transaction. **Only for small installs** (development, demo, CI). |
@@ -475,8 +565,9 @@ python manage.py verify_compact [--sample 20 | --customers PK ...] [--days 30]
                                 [--max-report 20]
 ```
 
-`verify_compact` compares sleep hours and wake times exactly and activity
-values within `--tolerance` (steps always allow at least 0.5, since they are
+`verify_compact` compares sleep hours and wake times exactly, the stage
+intervals of `get_sleep_intervals_by_day` (v1.1, row `sleep_stages`) exactly,
+and activity values within `--tolerance` (steps always allow at least 0.5, since they are
 stored as whole numbers). The known differences between the two read paths
 (0.1 kcal rounding, the exact-resolution grid requirement, and others) are
 listed in

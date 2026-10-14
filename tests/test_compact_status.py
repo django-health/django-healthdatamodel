@@ -90,6 +90,38 @@ def test_pending_until_backfilled(customer, settings):
     assert "pending: 0" in out and "READY:" in out
 
 
+def test_coverage_counts_unmapped_asleep_values(customer, settings):
+    # A customer whose only sleep history uses an uncatalogued "...Asleep*"
+    # value is compactable (prefix fallback), so is pending until backfilled
+    # rather than silently treated as having no compactable data.
+    from healthdatamodel.constants import DataSource
+    from healthdatamodel.ingest import ingest_records
+    from healthdatamodel.schemas import RecordInput
+
+    settings.HEALTHDATAMODEL_SAVE_COMPACT = False
+    ingest_records(
+        customer,
+        [
+            RecordInput(
+                startDate=OLD - timedelta(hours=9),
+                endDate=OLD - timedelta(hours=1),
+                creationDate=OLD,
+                sourceName="android",
+                value="HKCategoryValueSleepAnalysisAsleepLight",
+                type="HKCategoryTypeIdentifierSleepAnalysis",
+            )
+        ],
+        source=DataSource.HEALTH_CONNECT,
+        admin_create_date=OLD,
+    )
+    settings.HEALTHDATAMODEL_SAVE_COMPACT = True
+    result = backfill_coverage()
+    assert result.customers_with_records == 1
+    assert result.pending == [customer.pk]
+    backfill_from_records()
+    assert backfill_coverage().pending == []
+
+
 def test_coverage_scope(customer, settings):
     other = User.objects.create_user(username="status-other")
     _legacy_history_then_live(customer, settings)

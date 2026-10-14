@@ -122,7 +122,42 @@ def test_fail_on_sleep_mismatch(customer, settings, read_compact):
     row.save()
     out = _verify_fails()
     assert f"MISMATCH sleep customer={customer.pk} {TODAY}" in out
-    assert "FAIL: 1 mismatched day(s)" in out
+    assert f"MISMATCH sleep_stages customer={customer.pk} {TODAY}" in out
+    # The truncated night differs in hours and in its stage intervals.
+    assert _row(out, "sleep") == ["3", "1", "1"]
+    assert _row(out, "sleep_stages") == ["3", "1", "1"]
+    assert "FAIL: 2 mismatched day(s)" in out
+
+
+def test_fail_on_sleep_stage_mismatch_only(customer):
+    # Hours and wake time agree, but a stored awake interval is missing from
+    # the compact row: only the v1.1 stage check catches it.
+    _upload(customer)
+    ingest_records(
+        customer,
+        [
+            RecordInput(
+                startDate=datetime.combine(TODAY, time(2)).replace(tzinfo=timezone.utc),
+                endDate=datetime.combine(TODAY, time(2, 30)).replace(
+                    tzinfo=timezone.utc
+                ),
+                creationDate=NOW,
+                sourceName="apple",
+                value="HKCategoryValueSleepAnalysisAwake",
+                type="HKCategoryTypeIdentifierSleepAnalysis",
+            )
+        ],
+        source=DataSource.APPLE_HEALTH,
+        admin_create_date=NOW,
+    )
+    assert "PASS:" in _verify()
+    row = SleepDay.objects.get()
+    row.intervals = [entry for entry in row.intervals if entry[2] != "awake"]
+    row.save()
+    out = _verify_fails()
+    assert _row(out, "sleep") == ["3", "1", "0"]
+    assert _row(out, "sleep_stages") == ["3", "1", "1"]
+    assert f"MISMATCH sleep_stages customer={customer.pk} {TODAY}" in out
 
 
 def test_fail_when_not_backfilled_then_pass(customer, settings):
