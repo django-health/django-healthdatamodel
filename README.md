@@ -9,12 +9,12 @@ A reusable Django app for storing and querying health data in a schema inspired 
 
 ### SleepDay / ActivityDay — compact storage (v1.0)
 
-The primary storage format since v1.0. One row per key, no duplicates:
+The compact storage format introduced in v1.0, written alongside `Record` (dual-write) and read when `HEALTHDATAMODEL_READ_COMPACT = True` (see [settings](#compact-storage-settings--migration-v10) and the [upgrade checklist](docs/UPGRADING-1.0.md)). One row per key, no duplicates:
 
 - **`SleepDay`** — one night of sleep per `(customer, device, day)`, where `day` is the 2 pm–2 pm UTC sleep window. Intervals (with sleep stage) live in a JSON list on the row. A new upload for that user–device **replaces** the day.
 - **`ActivityDay`** — one day of one metric per `(customer, source, device, metric, day, resolution)`, holding a vector of slot values (96 slots at 15-minute resolution; 1 slot at daily). New uploads **merge slot-wise**: incoming slots overwrite, untouched slots keep their value. `None` slots mean "no data", preserving the None-vs-0.0 distinction in the query API.
 
-Values are normalised at write time (kcal, non-negative, steps as int, energy rounded to 0.1 kcal), so reads are straight sums. Compared to the `Record` log this is roughly a 100× reduction in rows written, and it removes the PostgreSQL requirement from the activity query path.
+Values are normalised at write time (kcal, non-negative, steps as int, energy rounded to 0.1 kcal), so reads are straight sums. Compared to the `Record` log this writes roughly 100× fewer rows, and the compact activity query path doesn't need PostgreSQL.
 
 ### Record
 
@@ -115,7 +115,7 @@ The day boundary defaults to **14:00 UTC** (2 pm), giving a window of 2 pm the p
 
 Device preference is read from `WearableConnection`. When multiple sleep sources are present, the `preferred_for_sleep` device wins; the default fallback order is `oura → whoop → apple → garmin`.
 
-Sleep functions work with any Django-supported backend (SQLite, PostgreSQL, etc.). The compact tables store sleep at the canonical 2 pm boundary but the stored interval pieces tile the original records exactly, so any `day_boundary_hour` is still served correctly.
+Sleep functions work with any Django-supported backend (SQLite, PostgreSQL, etc.) in both read modes. The compact tables store sleep at the canonical 2 pm boundary, but the stored interval pieces tile the original records exactly, so they can still serve any `day_boundary_hour`.
 
 ### Activity
 
@@ -144,7 +144,7 @@ records = get_activity_records(
 
 `get_activity_by_day` is a convenience wrapper around `get_activity_records(resolution_minutes=1440)`.
 
-With the default compact read path these work on **any backend**. The legacy read path (`HEALTHDATAMODEL_READ_COMPACT = False`) requires **PostgreSQL** (window-function CTEs for source-ranked deduplication).
+The legacy read path (`HEALTHDATAMODEL_READ_COMPACT = False`, the default in 1.0) requires **PostgreSQL** (window-function CTEs for source-ranked deduplication). With the compact read path (`HEALTHDATAMODEL_READ_COMPACT = True`) they work on **any backend**.
 
 ### Ranking and source utilities
 
@@ -391,39 +391,59 @@ negative strings already were.
 
 ## Compact storage settings & migration (v1.0)
 
-Upgrading from 0.x: run `python manage.py migrate`. Migration `0012` seeds the
-compact tables from your existing `Record` rows automatically. For large
-installs, set `HEALTHDATAMODEL_SKIP_BACKFILL_MIGRATION = True` first and run
-the batched, idempotent management command instead:
+> **Upgrading an existing install from 0.11.x?** Follow
+> [`docs/UPGRADING-1.0.md`](docs/UPGRADING-1.0.md), a numbered checklist
+> covering settings, migrate, dual-write soak, batched backfill,
+> verification, the per-environment read switch, and rollback.
 
-```
-python manage.py backfill_compact [--customers 1 2 3] [--since 2026-01-01]
-```
+The defaults are deliberately conservative. A project that sets nothing gets:
+**DDL only** (migration `0011` creates the two empty compact tables, and
+`0012` is a no-op), **dual writes** (every upload goes to both `Record` and
+the compact tables), and **legacy reads** (the query API keeps reading
+`Record`). Switching reads over is an explicit opt-in, made after the backfill
+and verification.
 
-All settings are optional:
-
-| Setting | Default | Purpose |
+| Setting | Default | Meaning |
 |---|---|---|
-| `HEALTHDATAMODEL_SAVE_RECORDS` | `True` | Write-through to the legacy `Record` log. Per-call override: `ingest_records(..., save_records=False)`. |
-| `HEALTHDATAMODEL_SAVE_COMPACT` | `True` | Escape hatch to stage the upgrade (disables compact writes). |
-| `HEALTHDATAMODEL_READ_COMPACT` | `True` | Instant rollback lever: `False` restores the legacy read path (requires the `Record` data to still be there, and PostgreSQL for activity). |
-| `HEALTHDATAMODEL_SKIP_BACKFILL_MIGRATION` | `False` | Skip the in-migration backfill; run `backfill_compact` yourself. |
+| `HEALTHDATAMODEL_SAVE_RECORDS` | `True` | Write every upload through to the legacy `Record` log. This is the rollback path, so keep it on throughout 1.0.x. Per-call override: `ingest_records(..., save_records=...)`. |
+| `HEALTHDATAMODEL_SAVE_COMPACT` | `True` | Write every upload to `SleepDay` / `ActivityDay`. |
+| `HEALTHDATAMODEL_READ_COMPACT` | `False` | Serve the query API from the compact tables. Set it to `True` per environment once `compact_status` and `verify_compact` pass. Setting it back to `False` rolls back with no data loss. The legacy path needs PostgreSQL for activity reads. |
+| `HEALTHDATAMODEL_BACKFILL_IN_MIGRATION` | `False` | Let migration `0012` seed the compact tables from `Record` inside the migration transaction. **Only for small installs** (development, demo, CI). |
 
-Records the compact schema cannot represent (unknown HK types, intervals not
-aligned to a day-dividing grid) are written to `Record` even when
-`save_records` is off — nothing is silently dropped.
+New installs with no legacy data can set `HEALTHDATAMODEL_READ_COMPACT = True`
+right away. The compact path works on any database backend.
 
-Before turning `Record` writes off, verify parity on your data:
+Records the compact schema can't represent (unknown HK types, intervals not
+aligned to a day-dividing grid) are always written to `Record`, even with
+`save_records=False`, so nothing is silently dropped. The package never
+deletes `Record` rows.
+
+### Management commands
 
 ```
-python manage.py verify_compact --sample 50 --days 30
+# Seed the compact tables from Record. Idempotent, resumable, commits per
+# upload, safe while dual-writes are live.
+python manage.py backfill_compact [--customers PK ... | --customer-range LO HI]
+                                  [--since ISO-DATETIME] [--customer-batch-size 200]
+                                  [--chunk-size 2000] [--progress-every 1000]
+
+# The gate before switching reads: settings, row counts, dual-write lag,
+# per-customer backfill coverage, and a READY / NOT READY verdict.
+python manage.py compact_status [--customers PK ... | --customer-range LO HI]
+                                [--skip-coverage] [--show-pending 20]
+                                [--lag-scan-limit 1000000] [--fail-if-not-ready]
+
+# Parity check: runs the query API in both read modes and diffs per day.
+# Prints PASS / FAIL and exits non-zero on any mismatch.
+python manage.py verify_compact [--sample 20 | --customers PK ...] [--days 30]
+                                [--end YYYY-MM-DD] [--tolerance 0.2]
+                                [--resolutions 15 1440] [--scan-limit 500000]
+                                [--max-report 20]
 ```
 
-It runs the query API in both read modes and diffs the results (exit code 1
-on mismatch). The intended rollout: upgrade & migrate → dual-write while
-validating → set `HEALTHDATAMODEL_SAVE_RECORDS = False` (this will be the
-default in a future release) → let your `Record` retention/archive policy
-drain the log.
+The known differences between the two read paths (0.1 kcal rounding, the
+exact-resolution grid requirement, and others) are listed in
+[`docs/UPGRADING-1.0.md`](docs/UPGRADING-1.0.md#known-differences-between-legacy-and-compact-reads).
 
 ## Admin
 

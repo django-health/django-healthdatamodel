@@ -1,11 +1,23 @@
 # v1.0.0 design — compact storage model
 
-Status: implemented (see PR); one refinement found during implementation is
-noted inline: writes carrying the *same* ``admin_create_date`` as the stored
-row are treated as one logical upload and **merge** (sleep: interval union;
-activity: same-slot sum), because the legacy read path groups by that
-timestamp and counts everything at the winning one.  Only a *newer*
-timestamp replaces/overwrites.
+Status: implemented (see PR). Refinements found during implementation and
+the consumer dry-run are noted inline:
+
+- Live writes that carry the *same* ``admin_create_date`` as the stored row
+  are treated as one logical upload and **merge** (sleep: interval union;
+  activity: same-slot sum), because the legacy read path groups by that
+  timestamp and counts everything at the winning one. Only a *newer*
+  timestamp replaces or overwrites.
+- The backfill replays each upload complete, so it uses **replay mode**: a
+  matching timestamp replaces instead of merging (otherwise re-runs
+  double-count activity), and a replayed upload older than the stored row
+  never overwrites it.
+- **Safe defaults**: reads stay on `Record` (`READ_COMPACT=False`) and the
+  `0012` data migration is a no-op unless opted in. A consumer who sets
+  nothing gets DDL plus dual writes. Read switch-over is an explicit,
+  per-environment step.
+
+Operational checklist for consumers: [`UPGRADING-1.0.md`](UPGRADING-1.0.md).
 Informed by: `wellness_format_analysis.md` (2026-05 wellrider extract analysis — 245 MB raw
 → 3.1 MB compact, 1.3%, with zero information loss for SRI + activity metrics).
 
@@ -199,7 +211,9 @@ uploads touch a handful of rows, so lock scope is tiny. Async variants mirror th
 ## Query changes
 
 Public API unchanged; internals dispatch on `settings.HEALTHDATAMODEL_READ_COMPACT`
-(default `True`; setting it `False` is the instant rollback lever while dual-writing).
+(default `False` in v1.0.0: consumers opt in per environment after backfilling and
+verifying; setting it back to `False` is the instant rollback lever while
+dual-writing).
 
 - `get_sleep_by_day`: one range query over `SleepDay` for `[start, end]` instead of
   3 queries × N days over `Record`. Per day: pick device via the existing
@@ -224,24 +238,38 @@ existing SQLite CI (which today cannot exercise `get_activity_records` at all).
 New migrations:
 
 - `0011_activityday_sleepday` — schema only (depends on `0010_backfill_activated_at`
-  from v0.10.0).
-- `0012_backfill_compact` — `RunPython` data migration seeding compact tables from
-  `Record`, honoring `settings.HEALTHDATAMODEL_SKIP_BACKFILL_MIGRATION` (default
-  `False`) so large installs can skip it and run the management command instead.
+  from v0.10.0). Creates two empty tables, so it runs in seconds.
+- `0012_backfill_compact` — `RunPython` data migration that seeds the compact
+  tables from `Record` **only if** `settings.HEALTHDATAMODEL_BACKFILL_IN_MIGRATION`
+  is `True` (default `False`). It runs inside the migration transaction, so it is
+  meant only for small installs. Everyone else runs the management command.
 
 Backfill implementation (`healthdatamodel/compat.py`):
 
-- `backfill_from_records(customers=None, since=None, batch_size=…)` replays `Record`
-  rows **grouped by upload (`admin_create_date`), oldest → newest**, through the *same
-  routing code* the live ingest path uses. Replaying through one code path guarantees
-  the backfilled state is byte-identical to what dual-writing would have produced, and
-  makes the operation idempotent (re-running converges).
-- `manage.py backfill_compact [--customers …] [--since …]` wraps it with batching and
-  progress output for big tables; safe to run while dual-writes are live (same
-  row-locking as ingest).
-- `manage.py verify_compact [--sample N]` — parity checker: runs the query API in both
-  read modes for sampled customers/date ranges and diffs the results. This is the
-  consumer's pre-flight check before flipping `save_records` off.
+- `backfill_from_records(customers=None, since=None, chunk_size=…, *, customer_range=…,
+  customer_batch_size=…, progress_every=…)` replays `Record` rows **grouped by upload
+  (`customer, admin_create_date, source`), oldest → newest**, through the *same
+  routing code* the live ingest path uses (`apply_compact(..., replay=True)`).
+  Replaying through one code path makes the backfilled state identical to what
+  dual-writing would have produced. Replay mode makes the operation idempotent:
+  a replayed upload replaces its own earlier write, and an older upload never
+  overwrites a newer stored row (sleep keeps the day; activity only fills empty
+  slots). Customers are keyset-paginated over the user table, with one `Record`
+  query per customer batch restricted to compactable types. Each upload commits in
+  its own `atomic()` block, so there is never one giant transaction.
+- `manage.py backfill_compact [--customers … | --customer-range LO HI] [--since …]`
+  wraps it with progress output, per-batch resume hints and a summary. It is safe to
+  run while dual-writes are live (same row locking as ingest).
+- `manage.py compact_status` is the gate before flipping reads. It reports
+  effective settings, compact row counts, customers and day range, dual-write lag
+  (compactable `Record` rows newer than the newest compact upload), and
+  per-customer backfill coverage (customers whose compact history doesn't reach
+  back to their oldest `Record` day), and ends with READY / NOT READY.
+- `manage.py verify_compact [--sample N | --customers …] [--days …]` is the parity
+  checker. It runs the query API in both read modes for the customers with the
+  most recent uploads, diffs sleep, daily and sub-daily activity per day, prints
+  a PASS / FAIL line, and exits non-zero on any mismatch. Consumers run it before
+  flipping `READ_COMPACT` on (and later before turning `save_records` off).
 - Production note: backfill only sees what's in `Record` (30-day archive horizon).
   History older than the archive cutoff is seeded from the archive extracts if wanted —
   out of scope for the package, but `backfill_from_records` accepts an iterable of
@@ -251,18 +279,20 @@ Backfill implementation (`healthdatamodel/compat.py`):
 
 | Setting | v1.0.0 default | Purpose |
 |---|---|---|
-| `HEALTHDATAMODEL_SAVE_RECORDS` | `True` | write-through to legacy `Record` |
-| `HEALTHDATAMODEL_SAVE_COMPACT` | `True` | escape hatch to stage the upgrade |
-| `HEALTHDATAMODEL_READ_COMPACT` | `True` | instant rollback lever for the read path |
-| `HEALTHDATAMODEL_SKIP_BACKFILL_MIGRATION` | `False` | big installs backfill via command |
+| `HEALTHDATAMODEL_SAVE_RECORDS` | `True` | write-through to legacy `Record` (the rollback path) |
+| `HEALTHDATAMODEL_SAVE_COMPACT` | `True` | dual-write to the compact tables |
+| `HEALTHDATAMODEL_READ_COMPACT` | `False` | opt-in read switch, per environment; `False` is the rollback |
+| `HEALTHDATAMODEL_BACKFILL_IN_MIGRATION` | `False` | let `0012` backfill in-migration (small installs only) |
 
 ## Rollout plan
 
-1. **v1.0.0** — everything above. Consumers upgrade, `migrate` (auto-backfill for
-   normal-sized installs), and silently start dual-writing + compact-reading. No caller
-   code changes.
-2. Consumers validate with `verify_compact`; production watches for a full
-   archive cycle (30 days) so `Record` holds nothing the compact tables don't.
+1. **v1.0.0** — everything above. Consumers upgrade and `migrate` (DDL only), and
+   start dual-writing while still reading `Record`. No caller code changes. They then
+   backfill with `backfill_compact` in batches, gate on `compact_status` and
+   `verify_compact`, and flip `READ_COMPACT` per environment
+   ([`UPGRADING-1.0.md`](UPGRADING-1.0.md)).
+2. Production runs on compact reads, with `Record` still written, for at least a full
+   archive cycle (30 days), so that `Record` holds nothing the compact tables don't.
 3. **v1.1.0** — `HEALTHDATAMODEL_SAVE_RECORDS` default flips to `False` (documented in
    changelog; consumers who still want the log pin it `True`). `Record` drains via the
    existing archive job.
@@ -282,7 +312,18 @@ Backfill implementation (`healthdatamodel/compat.py`):
 - **Backfill parity**: ingest via legacy only, run `backfill_from_records`, compare.
 - **Merge-semantics units**: slot overwrite vs preserve-None, sleep replace-on-upload,
   interval splitting at 14:00, multi-device same-source summing, idempotent re-backfill.
-- **Migration check** already in CI catches drift.
+- **Replay idempotency**: re-running the backfill over dual-written and already
+  backfilled data changes nothing, and older replays never regress newer rows.
+- **Operational commands**: `backfill_compact` (ranges, progress, resume),
+  `verify_compact` (PASS/FAIL, per-check counts, forced modes) and `compact_status`
+  (coverage, lag, verdict).
+- **Migration check** already in CI catches drift. CI also runs `manage.py check`
+  on the demo project, since `makemigrations --check` skips system checks: an
+  over-long index name (models.E034) shipped once because of this.
+
+Known differences between the two read paths that remain by design (rounding,
+grid alignment, tied-row representation, …) are listed in
+[`UPGRADING-1.0.md`](UPGRADING-1.0.md#known-differences-between-legacy-and-compact-reads).
 
 ## Decisions (with recommendations)
 
