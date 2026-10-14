@@ -150,6 +150,38 @@ class TestBackfill:
         assert len(row.intervals) == 2
         assert get_sleep_hours_by_day(customer, TODAY, TODAY)[TODAY] == 4.0
 
+    @pytest.mark.parametrize("read_compact", [True, False])
+    def test_unmapped_asleep_value_backfilled(
+        self, customer, legacy_only, settings, read_compact
+    ):
+        # Prefix fallback on the replay path: an uncatalogued "...Asleep*"
+        # value is compacted as "unspecified", so both read modes agree.
+        settings.HEALTHDATAMODEL_READ_COMPACT = read_compact
+        ingest_records(
+            customer,
+            [
+                RecordInput(
+                    startDate=datetime.combine(YESTERDAY, time(23)).replace(
+                        tzinfo=timezone.utc
+                    ),
+                    endDate=datetime.combine(TODAY, time(6)).replace(
+                        tzinfo=timezone.utc
+                    ),
+                    creationDate=NOW,
+                    sourceName="android",
+                    value="HKCategoryValueSleepAnalysisAsleepLight",
+                    type=SLEEP_TYPE,
+                )
+            ],
+            source=DataSource.HEALTH_CONNECT,
+            admin_create_date=NOW,
+        )
+        assert SleepDay.objects.count() == 0
+        backfill_from_records()
+        row = SleepDay.objects.get(customer=customer)
+        assert [entry[2] for entry in row.intervals] == ["unspecified"]
+        assert get_sleep_hours_by_day(customer, TODAY, TODAY)[TODAY] == 7.0
+
     def test_replay_order_newest_upload_wins(
         self, customer, legacy_only, compact_reads
     ):

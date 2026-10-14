@@ -8,6 +8,9 @@ recent uploads (or ``--customers``), runs the public query API with
 * sleep — ``get_sleep_by_day`` hours and wake time, both **exactly**
   (compact sleep intervals are stored at full precision, so any difference
   is a real one);
+* sleep stages — ``get_sleep_intervals_by_day`` (every stage of the chosen
+  device and upload, including awake and in-bed, which the v1.1 summary and
+  regularity functions read), compared exactly;
 * activity — for each metric, ``get_activity_by_day`` (daily records,
   ``1440``) and ``get_activity_records`` at each other ``--resolutions``
   value, compared slot by slot after summing tied rows (legacy returns one
@@ -36,6 +39,7 @@ from healthdatamodel.query import (
     get_activity_by_day,
     get_activity_records,
     get_sleep_by_day,
+    get_sleep_intervals_by_day,
 )
 
 _SCAN_PAGE = 5000
@@ -178,7 +182,7 @@ class Command(BaseCommand):
             raise CommandError(f"Unknown customer pk(s): {', '.join(sorted(missing))}")
 
         activity_supported = connection.vendor == "postgresql"
-        checks: dict[str, _Stats] = {"sleep": _Stats()}
+        checks: dict[str, _Stats] = {"sleep": _Stats(), "sleep_stages": _Stats()}
         if activity_supported:
             for metric in ActivityMetric:
                 for resolution in options["resolutions"]:
@@ -196,6 +200,7 @@ class Command(BaseCommand):
         )
         for customer in customers:
             self._compare_sleep(customer, start, end, checks["sleep"])
+            self._compare_sleep_stages(customer, start, end, checks["sleep_stages"])
             if not activity_supported:
                 continue
             for metric in ActivityMetric:
@@ -261,6 +266,23 @@ class Command(BaseCommand):
                 stats.mismatched += 1
                 self._report(
                     f"sleep customer={customer.pk} {day}: compact={comp} legacy={leg}"
+                )
+
+    def _compare_sleep_stages(self, customer, start, end, stats):
+        with override_settings(HEALTHDATAMODEL_READ_COMPACT=True):
+            compact = get_sleep_intervals_by_day(customer, start, end)
+        with override_settings(HEALTHDATAMODEL_READ_COMPACT=False):
+            legacy = get_sleep_intervals_by_day(customer, start, end)
+        for day in compact:
+            comp, leg = compact[day], legacy[day]
+            stats.days += 1
+            if comp or leg:
+                stats.with_data += 1
+            if comp != leg:
+                stats.mismatched += 1
+                self._report(
+                    f"sleep_stages customer={customer.pk} {day}: "
+                    f"compact={len(comp)} interval(s) legacy={len(leg)} interval(s)"
                 )
 
     def _compare_activity(

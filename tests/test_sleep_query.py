@@ -10,12 +10,15 @@ compact/legacy parity tests.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 from django.contrib.auth import get_user_model
 
+from healthdatamodel.compact import _PLACEHOLDER_DATE
 from healthdatamodel.constants import DataSource
 from healthdatamodel.ingest import ingest_records
+from healthdatamodel.models import SleepDay, WearableConnection
 from healthdatamodel.query import (
     DailySleepSummary,
     SleepInterval,
@@ -26,6 +29,13 @@ from healthdatamodel.query import (
     get_sleep_summary_by_day,
 )
 from healthdatamodel.schemas import RecordInput
+
+try:
+    NEW_YORK = ZoneInfo("America/New_York")
+except ZoneInfoNotFoundError:  # pragma: no cover - no tz database here
+    NEW_YORK = None
+
+needs_tzdata = pytest.mark.skipif(NEW_YORK is None, reason="no IANA tz database")
 
 User = get_user_model()
 
@@ -205,6 +215,113 @@ class TestSleepIntervalsByDay:
             SleepInterval(at(23), boundary, "unspecified", "apple")
         ]
 
+    def test_custom_boundary_record_crossing_canonical_boundary(self, customer):
+        # Compact rows split this record at the canonical 14:00 UTC boundary;
+        # with an 18:00 window both read modes must still return one interval.
+        ingest_night(
+            customer,
+            [(at(23), at(7), CORE), (at(13), at(15, night_of=TOMORROW), CORE)],
+        )
+        result = get_sleep_intervals_by_day(
+            customer, TODAY, TODAY, day_boundary_hour=18
+        )
+        assert result[TODAY] == [
+            SleepInterval(at(23), at(7), "core", "apple"),
+            SleepInterval(at(13), at(15, night_of=TOMORROW), "core", "apple"),
+        ]
+        hours = get_sleep_by_day(customer, TODAY, TODAY, day_boundary_hour=18)
+        assert hours[TODAY].hours == pytest.approx(10.0)
+        summary = get_sleep_summary_by_day(customer, TODAY, TODAY, day_boundary_hour=18)
+        assert (summary[TODAY].asleep_minutes, summary[TODAY].nap_minutes) == (
+            480,
+            120,
+        )
+
+    def test_same_stage_overlaps_merged(self, customer):
+        ingest_night(
+            customer,
+            [(at(23), at(3), CORE), (at(2), at(5), CORE), (at(5), at(7), CORE)],
+        )
+        assert get_sleep_intervals_by_day(customer, TODAY, TODAY)[TODAY] == [
+            SleepInterval(at(23), at(7), "core", "apple")
+        ]
+
+    def test_unmapped_asleep_value_is_unspecified(self, customer):
+        # Prefix fallback: an uncatalogued "...Asleep*" value is asleep in
+        # both read modes (compact stores it as "unspecified").
+        ingest_night(
+            customer,
+            [
+                (at(23), at(3), "HKCategoryValueSleepAnalysisAsleepLight"),
+                (at(3), at(3, 30), AWAKE),
+                (at(3, 30), at(7), CORE),
+            ],
+        )
+        result = get_sleep_intervals_by_day(customer, TODAY, TODAY)[TODAY]
+        assert [item.stage for item in result] == ["unspecified", "awake", "core"]
+        summary = get_sleep_summary_by_day(customer, TODAY, TODAY)[TODAY]
+        assert (summary.asleep_minutes, summary.awakenings) == (450, 1)
+
+    def test_preferred_sleep_brand_respected(self, customer):
+        # Same upload, two devices: the default order would pick apple, the
+        # preferred_for_sleep connection picks garmin -- in every function.
+        ingest_night(customer, [(at(23), at(7), CORE)], sourceName="apple")
+        ingest_night(
+            customer,
+            [
+                (at(22), at(2), CORE),
+                (at(2), at(2, 30), AWAKE),
+                (at(2, 30), at(6), DEEP),
+            ],
+            sourceName="garmin",
+            source=DataSource.GARMIN,
+        )
+        WearableConnection.objects.create(
+            customer=customer,
+            data_source=DataSource.GARMIN,
+            device_brand="garmin",
+            preferred_for_sleep=True,
+            status="active",
+        )
+        intervals = get_sleep_intervals_by_day(customer, TODAY, TODAY)[TODAY]
+        assert {item.device for item in intervals} == {"garmin"}
+        assert get_sleep_by_day(customer, TODAY, TODAY)[TODAY].hours == 7.5
+        summary = get_sleep_summary_by_day(customer, TODAY, TODAY)[TODAY]
+        assert (summary.device, summary.asleep_minutes, summary.awakenings) == (
+            "garmin",
+            450,
+            1,
+        )
+
+    def test_device_ranking_tie_is_deterministic(self, customer):
+        # Names differing only in case tie in the ranking; both read modes
+        # must break the tie the same way (sorted name order).
+        ingest_night(customer, [(at(23), at(7), CORE)], sourceName="apple")
+        ingest_night(customer, [(at(22), at(6), DEEP)], sourceName="Apple")
+        intervals = get_sleep_intervals_by_day(customer, TODAY, TODAY)[TODAY]
+        assert intervals == [SleepInterval(at(22), at(6), "deep", "Apple")]
+
+    def test_placeholder_row_never_surfaces(self, customer):
+        # The row-lock placeholders compact writes insert (empty intervals,
+        # 1970 timestamp) are overwritten in the same transaction; even if one
+        # were visible it must not count as data or win a selection.
+        SleepDay.objects.create(
+            customer=customer,
+            source=DataSource.GARMIN,
+            device="aaa-placeholder",
+            day=TODAY,
+            intervals=[],
+            admin_create_date=_PLACEHOLDER_DATE,
+        )
+        assert get_sleep_intervals_by_day(customer, TODAY, TODAY)[TODAY] == []
+        assert get_sleep_by_day(customer, TODAY, TODAY)[TODAY].hours is None
+        assert get_sleep_summary_by_day(customer, TODAY, TODAY)[TODAY].device is None
+        ingest_night(customer, [(at(23), at(7), CORE)])
+        assert get_sleep_intervals_by_day(customer, TODAY, TODAY)[TODAY] == [
+            SleepInterval(at(23), at(7), "core", "apple")
+        ]
+        assert get_sleep_regularity_index(customer, TODAY).days_with_data == 1
+
 
 # ---------------------------------------------------------------------------
 # get_sleep_summary_by_day
@@ -332,6 +449,52 @@ class TestSleepSummaryByDay:
         assert result[TODAY].asleep_minutes == 480
         assert result[YESTERDAY].asleep_minutes is None
         assert result[TOMORROW].asleep_minutes is None
+
+    def test_nap_crossing_boundary_split_between_days(self, customer):
+        # A 13:00-15:00 UTC nap straddles the 14:00 boundary: one hour is a nap
+        # at the end of TODAY's window, the other at the start of TOMORROW's.
+        ingest_night(
+            customer,
+            [
+                (at(23), at(7), CORE),
+                (at(13), at(15, night_of=TOMORROW), CORE),
+                (at(23, night_of=TOMORROW), at(6, night_of=TOMORROW), CORE),
+            ],
+        )
+        result = get_sleep_summary_by_day(customer, TODAY, TOMORROW)
+        assert (result[TODAY].sleep_start, result[TODAY].sleep_end) == (at(23), at(7))
+        assert (result[TODAY].asleep_minutes, result[TODAY].nap_minutes) == (480, 60)
+        assert result[TOMORROW].sleep_start == at(23, night_of=TOMORROW)
+        assert (result[TOMORROW].asleep_minutes, result[TOMORROW].nap_minutes) == (
+            420,
+            60,
+        )
+
+    def test_single_night_in_range(self, customer):
+        ingest_night(customer, [(at(23), at(7), CORE)])
+        result = get_sleep_summary_by_day(customer, TODAY - timedelta(days=6), TODAY)
+        assert len(result) == 7
+        assert [day for day, s in result.items() if s.asleep_minutes] == [TODAY]
+
+    @needs_tzdata
+    def test_dst_spring_forward_night(self, customer):
+        # US DST starts 2025-03-09 02:00 local. Asleep 04:00-11:00 UTC is
+        # 23:00 EST -> 07:00 EDT: seven real hours.
+        night = date(2025, 3, 9)
+        start = datetime(2025, 3, 9, 4, 0, tzinfo=timezone.utc)
+        end = datetime(2025, 3, 9, 11, 0, tzinfo=timezone.utc)
+        ingest_night(customer, [(start, end, CORE)])
+        summary = get_sleep_summary_by_day(customer, night, night, tz=NEW_YORK)[night]
+        assert summary.asleep_minutes == 420
+        assert (summary.sleep_start.hour, summary.sleep_start.utcoffset()) == (
+            23,
+            timedelta(hours=-5),
+        )
+        assert (summary.sleep_end.hour, summary.sleep_end.utcoffset()) == (
+            7,
+            timedelta(hours=-4),
+        )
+        assert summary.sleep_start == start and summary.sleep_end == end
 
 
 # ---------------------------------------------------------------------------

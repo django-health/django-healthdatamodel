@@ -267,7 +267,10 @@ def _select_sleep_legacy(
         return None
 
     upload_dt = most_recent.admin_create_date
-    devices = list(
+    # Sorted like the compact path, so devices that tie in the ranking
+    # (e.g. names differing only in case) resolve the same way in both
+    # read modes instead of depending on database row order.
+    devices = sorted(
         sleep_qs.filter(admin_create_date=upload_dt)
         .values_list("sourceName", flat=True)
         .distinct()
@@ -403,17 +406,36 @@ def _daily_sleep(selection: _SleepSelection | None) -> DailySleep:
 
 
 def _clipped_intervals(selection: _SleepSelection | None) -> list[SleepInterval]:
-    """All stages of a selection clipped to its window, sorted by start."""
+    """All stages of a selection clipped to its window, sorted by start.
+
+    Intervals of the same stage that overlap or touch are merged.  The
+    compact tables store a record crossing the canonical 14:00 UTC boundary
+    as two pieces, so without this a ``day_boundary_hour`` other than 14
+    would return one interval in legacy mode and two in compact mode; the
+    per-stage union is the same in both.
+    """
     if selection is None:
         return []
-    clipped = {
-        (max(s, selection.window_start), min(e, selection.window_end), stage)
-        for s, e, stage in selection.intervals
-    }
+    by_stage: dict[str, list[tuple[datetime, datetime]]] = defaultdict(list)
+    for s, e, stage in selection.intervals:
+        s, e = max(s, selection.window_start), min(e, selection.window_end)
+        if s < e:
+            by_stage[stage].append((s, e))
+    merged: list[tuple[datetime, datetime, str]] = []
+    for stage, spans in by_stage.items():
+        current: tuple[datetime, datetime] | None = None
+        for s, e in sorted(spans):
+            if current is not None and s <= current[1]:
+                current = (current[0], max(current[1], e))
+                continue
+            if current is not None:
+                merged.append((*current, stage))
+            current = (s, e)
+        if current is not None:
+            merged.append((*current, stage))
     return [
         SleepInterval(start=s, end=e, stage=stage, device=selection.device)
-        for s, e, stage in sorted(clipped)
-        if s < e
+        for s, e, stage in sorted(merged)
     ]
 
 
@@ -656,7 +678,10 @@ def get_sleep_intervals_by_day(
     (same internal routine): the latest ``admin_create_date`` among asleep
     records overlapping the window, then the device ranking.  All stages of
     that device and upload (asleep stages, ``awake``, ``in_bed``) are
-    returned, clipped to the window and sorted by start.
+    returned, clipped to the window and sorted by start.  Intervals of the
+    same stage that overlap or touch are merged into one, so the result is
+    identical in both read modes (the compact tables store a record that
+    crosses 14:00 UTC as two pieces).
 
     Parameters
     ----------
@@ -700,7 +725,10 @@ def get_sleep_summary_by_day(
     ----------
     tz:
         Time zone for ``sleep_start`` / ``sleep_end`` (default UTC).  Only
-        the presentation changes; the day windows stay in UTC.
+        the presentation changes; the day windows stay in UTC.  For
+        consumers that store true UTC.  If you store local wall-clock time
+        labelled UTC, leave it ``None``: the values are then already local
+        (and the 14:00 "UTC" boundary is 14:00 local).
     main_sleep_gap_minutes:
         Gap (minutes) that splits the night into separate sessions.
 

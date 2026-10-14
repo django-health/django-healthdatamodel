@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import random
 from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 
@@ -13,6 +15,13 @@ from healthdatamodel.sleep import (
     sleep_regularity_from_intervals,
     summarize_sleep_intervals,
 )
+
+try:
+    NEW_YORK = ZoneInfo("America/New_York")
+except ZoneInfoNotFoundError:  # pragma: no cover - no tz database here
+    NEW_YORK = None
+
+needs_tzdata = pytest.mark.skipif(NEW_YORK is None, reason="no IANA tz database")
 
 TODAY = date(2025, 6, 10)
 YESTERDAY = TODAY - timedelta(days=1)
@@ -222,6 +231,45 @@ class TestSummary:
         assert result.asleep_minutes == 480
         assert result.device is None
 
+    def test_nap_at_end_of_window_clipped_at_boundary(self):
+        # A 13:00-15:00 UTC nap: only the hour before the 14:00 boundary
+        # belongs to this night; it is a separate session from the night.
+        result = summarize(
+            [iv(at(23), at(7), "core"), iv(at(13), at(15, day=TODAY), "core")]
+        )
+        assert (result.sleep_start, result.sleep_end) == (at(23), at(7))
+        assert result.asleep_minutes == 480
+        assert result.nap_minutes == 60
+
+    @needs_tzdata
+    def test_dst_fall_back_night(self):
+        # US DST ends 2025-11-02 02:00 local: 22:00 EDT -> 07:00 EST is
+        # 03:00 -> 13:00 UTC, ten real hours.
+        window = sleep_day_window(date(2025, 11, 2))
+        start = datetime(2025, 11, 2, 2, 0, tzinfo=timezone.utc)
+        end = datetime(2025, 11, 2, 12, 0, tzinfo=timezone.utc)
+        result = summarize_sleep_intervals(
+            [iv(start, end, "core")], *window, tz=NEW_YORK
+        )
+        assert result.asleep_minutes == 600
+        assert (result.sleep_start.hour, result.sleep_start.utcoffset()) == (
+            22,
+            timedelta(hours=-4),
+        )
+        assert (result.sleep_end.hour, result.sleep_end.utcoffset()) == (
+            7,
+            timedelta(hours=-5),
+        )
+
+    def test_aware_non_utc_inputs(self):
+        # Inputs in any time zone are compared as instants.
+        local = timezone(timedelta(hours=-7))
+        result = summarize(
+            [iv(at(23).astimezone(local), at(7).astimezone(local), "core")]
+        )
+        assert result.asleep_minutes == 480
+        assert result.sleep_start == at(23)
+
 
 # ---------------------------------------------------------------------------
 # sleep_regularity_from_intervals
@@ -311,3 +359,70 @@ class TestRegularity:
     def test_days_must_be_at_least_two(self):
         with pytest.raises(ValueError):
             sleep_regularity_from_intervals({}, TODAY, days=1)
+
+    def test_matches_phillips_definition_by_brute_force(self):
+        # Oracle: Phillips et al. (2017), SRI = -100 + 200/(M(N-1)) * sum of
+        # delta(s(t), s(t + 24 h)), evaluated directly on minute instants
+        # (a minute is asleep when its start lies in an asleep interval),
+        # skipping pairs that touch a day without data.  Random intervals
+        # with second offsets exercise the minute rounding.
+        rng = random.Random(20261014)
+        for trial in range(25):
+            days = rng.randint(2, 6)
+            end_day = TODAY + timedelta(days=trial % 3)
+            first = end_day - timedelta(days=days - 1)
+            by_day = {}
+            for offset in range(days):
+                day = first + timedelta(days=offset)
+                if rng.random() < 0.2:
+                    continue  # no data that night
+                window_start, _ = sleep_day_window(day)
+                spans = []
+                for _ in range(rng.randint(1, 4)):
+                    start = window_start + timedelta(seconds=rng.randint(0, 86399))
+                    length = timedelta(seconds=rng.randint(1, 6 * 3600))
+                    # Some intervals spill outside the window: must be clipped.
+                    spans.append((start, start + length))
+                if rng.random() < 0.3:
+                    spans.append((window_start - timedelta(hours=1), window_start))
+                by_day[day] = spans
+
+            def asleep(t, by_day=by_day, first=first, days=days):
+                for offset in range(days):
+                    day = first + timedelta(days=offset)
+                    window_start, window_end = sleep_day_window(day)
+                    if window_start <= t < window_end:
+                        if not by_day.get(day):
+                            return None
+                        return int(any(s <= t < e for s, e in by_day[day]))
+                raise AssertionError(t)
+
+            origin = sleep_day_window(first)[0]
+            pairs = matches = 0
+            for minute in range((days - 1) * 1440):
+                t = origin + timedelta(minutes=minute)
+                a, b = asleep(t), asleep(t + timedelta(hours=24))
+                if a is None or b is None:
+                    continue
+                pairs += 1
+                matches += a == b
+
+            result = sleep_regularity_from_intervals(by_day, end_day, days=days)
+            assert result.minutes_compared == pairs
+            assert result.days_with_data == sum(1 for v in by_day.values() if v)
+            if pairs == 0 or result.days_with_data < 2:
+                assert result.sri is None
+            else:
+                assert result.sri == pytest.approx(-100 + 200 * matches / pairs)
+                assert result.consistency_pct == pytest.approx(100 * matches / pairs)
+
+    def test_sub_minute_interval_marks_no_minute_unless_it_covers_a_start(self):
+        ((start0, _),) = night(DAYS[0], 23, 8)
+        ((start1, _),) = night(DAYS[1], 23, 8)
+        by_day = {
+            DAYS[0]: [(start0 + timedelta(seconds=10), start0 + timedelta(seconds=50))],
+            DAYS[1]: [(start1, start1 + timedelta(seconds=1))],
+        }
+        result = sleep_regularity_from_intervals(by_day, DAYS[1], days=2)
+        # DAYS[0] marks nothing; DAYS[1] marks one minute 24 h later.
+        assert result.sri == pytest.approx(-100 + 200 * 1439 / 1440)

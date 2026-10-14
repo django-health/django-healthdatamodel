@@ -299,26 +299,37 @@ def backfill_coverage(
     ``(customer, type, startDate)`` / ``(customer, day)`` /
     ``(customer, metric, day)`` indexes — no scan of ``Record``.
 
-    Caveat: a customer whose oldest row is uncompactable (an activity record
-    off the resolution grid, an unknown sleep value) stays pending even
-    after a backfill; ``verify_compact --customers <pk>`` tells whether the
-    reads actually differ.
+    Sleep rows count only if the router compacts their value (catalogued
+    values and any other ``...Asleep*`` value); other unknown sleep values
+    are ignored here.  Caveat: a customer whose oldest row is otherwise
+    uncompactable (an activity record off the resolution grid, a zero-length
+    sleep record) stays pending even after a backfill;
+    ``verify_compact --customers <pk>`` tells whether the reads actually
+    differ.
     """
-    from django.db.models import OuterRef, Subquery
+    from django.db.models import OuterRef, Q, Subquery
 
     from healthdatamodel.compact import sleep_day_for
-    from healthdatamodel.constants import HK_SLEEP_VALUE_TO_STAGE
+    from healthdatamodel.constants import (
+        HK_SLEEP_VALUE_TO_STAGE,
+        SLEEP_ASLEEP_VALUE_PREFIX,
+    )
     from healthdatamodel.models import ActivityDay, SleepDay
 
-    def first_record(record_type: str, **extra: Any) -> Subquery:
+    def first_record(record_type: str, *filters: Q) -> Subquery:
         return Subquery(
-            Record.objects.filter(customer=OuterRef("pk"), type=record_type, **extra)
+            Record.objects.filter(*filters, customer=OuterRef("pk"), type=record_type)
             .order_by("startDate")
             .values("startDate")[:1]
         )
 
+    # Sleep values the router compacts: the catalogued ones plus any other
+    # "...Asleep*" value (see ``constants.sleep_stage_for_value``).
+    compactable_sleep = Q(value__in=list(HK_SLEEP_VALUE_TO_STAGE)) | Q(
+        value__startswith=SLEEP_ASLEEP_VALUE_PREFIX
+    )
     annotations: dict[str, Subquery] = {
-        "rec_sleep": first_record(SLEEP_TYPE, value__in=list(HK_SLEEP_VALUE_TO_STAGE)),
+        "rec_sleep": first_record(SLEEP_TYPE, compactable_sleep),
         "cmp_sleep": Subquery(
             SleepDay.objects.filter(customer=OuterRef("pk"))
             .order_by("day")
