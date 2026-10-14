@@ -68,7 +68,7 @@ class Migration(migrations.Migration):
                 "indexes": [
                     models.Index(
                         fields=["customer", "metric", "day"],
-                        name="activityday_cust_metric_day_idx",
+                        name="actday_cust_metric_day_idx",
                     )
                 ],
                 "constraints": [
