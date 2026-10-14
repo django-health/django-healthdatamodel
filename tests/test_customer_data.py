@@ -103,6 +103,8 @@ class TestDeleteCustomerHealthData:
         counts = delete_customer_health_data(alice)
         assert counts == {
             "records": 3,
+            "sleep_days": 0,
+            "activity_days": 1,
             "workouts": 2,
             "workout_metadata": 4,
             "rankings": len(DataSource.values),
@@ -126,6 +128,8 @@ class TestDeleteCustomerHealthData:
     def test_empty_customer(self, alice):
         assert delete_customer_health_data(alice) == {
             "records": 0,
+            "sleep_days": 0,
+            "activity_days": 0,
             "workouts": 0,
             "workout_metadata": 0,
             "rankings": 0,

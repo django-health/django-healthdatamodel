@@ -7,9 +7,18 @@ A reusable Django app for storing and querying health data in a schema inspired 
 
 ## Models
 
+### SleepDay / ActivityDay — compact storage (v1.0)
+
+The compact storage format introduced in v1.0, written alongside `Record` (dual-write) and read when `HEALTHDATAMODEL_READ_COMPACT = True` (see [settings](#compact-storage-settings--migration-v10) and the [upgrade checklist](docs/UPGRADING-1.0.md)). One row per key, no duplicates:
+
+- **`SleepDay`** — one night of sleep per `(customer, device, day)`, where `day` is the 2 pm–2 pm UTC sleep window. Intervals (with sleep stage) live in a JSON list on the row. A new upload for that user–device **replaces** the day.
+- **`ActivityDay`** — one day of one metric per `(customer, source, device, metric, day, resolution)`, holding a vector of slot values (96 slots at 15-minute resolution; 1 slot at daily). New uploads **merge slot-wise**: incoming slots overwrite, untouched slots keep their value. `None` slots mean "no data", preserving the None-vs-0.0 distinction in the query API.
+
+Values are normalised at write time (kcal, non-negative, steps as int, energy rounded to 0.1 kcal), so reads are straight sums. Compared to the `Record` log this writes roughly 100× fewer rows, and the compact activity query path doesn't need PostgreSQL.
+
 ### Record
 
-Stores individual health measurements. Each record has a `type` (e.g. `HKQuantityTypeIdentifierActiveEnergyBurned`), a `value`, a `unit`, and a `startDate`/`endDate` range. Records are associated with a user via `settings.AUTH_USER_MODEL`.
+Stores individual health measurements in the original append-only log format. Each record has a `type` (e.g. `HKQuantityTypeIdentifierActiveEnergyBurned`), a `value`, a `unit`, and a `startDate`/`endDate` range. Records are associated with a user via `settings.AUTH_USER_MODEL`. Since v1.0 this is an optional write-through log (see `HEALTHDATAMODEL_SAVE_RECORDS` below).
 
 ### Workout
 
@@ -106,7 +115,7 @@ The day boundary defaults to **14:00 UTC** (2 pm), giving a window of 2 pm the p
 
 Device preference is read from `WearableConnection`. When multiple sleep sources are present, the `preferred_for_sleep` device wins; the default fallback order is `oura → whoop → apple → garmin`.
 
-Sleep functions work with any Django-supported backend (SQLite, PostgreSQL, etc.).
+Sleep functions work with any Django-supported backend (SQLite, PostgreSQL, etc.) in both read modes. The compact tables store sleep at the canonical 2 pm boundary, but the stored interval pieces tile the original records exactly, so they can still serve any `day_boundary_hour`.
 
 ### Activity
 
@@ -135,7 +144,7 @@ records = get_activity_records(
 
 `get_activity_by_day` is a convenience wrapper around `get_activity_records(resolution_minutes=1440)`.
 
-Both require **PostgreSQL** (window-function CTEs for source-ranked deduplication).
+The legacy read path (`HEALTHDATAMODEL_READ_COMPACT = False`, the default in 1.0) requires **PostgreSQL** (window-function CTEs for source-ranked deduplication). With the compact read path (`HEALTHDATAMODEL_READ_COMPACT = True`) they work on **any backend**.
 
 ### Ranking and source utilities
 
@@ -205,9 +214,11 @@ ingest_compact_activity(
 
 One `Record` row is stored **per source per interval** — source-ranked deduplication happens at query time via `get_activity_records`.
 
+Every ingest call also writes the compact tables (`SleepDay` / `ActivityDay`, see [below](#compact-storage-settings--migration-v10)), in the same transaction as the `Record` insert.
+
 ### Async usage
 
-Both formats have `async` variants that use Django's `abulk_create`:
+Both formats have `async` variants. They run the sync ingest in a worker thread (`sync_to_async`), because the compact write needs a transaction with row locks:
 
 ```python
 await aingest_records(customer, records, source=DataSource.APPLE_HEALTH)
@@ -251,9 +262,19 @@ project does with a customer's health data.** Direct ORM access to `Record`,
 `bulk_create`, raw SQL over `healthdatamodel_record`) is **unsupported from
 v1.0 onward**: v1.0 adds compact storage tables that must be kept in sync
 with `Record`, and only these helpers (plus the query and ingest APIs above)
-will do that. In v0.11 they are thin wrappers over the existing tables, so
-switching to them now is behaviour-preserving and makes the v1.0 upgrade a
-version bump.
+do that. They were introduced in v0.11 as thin wrappers over the existing
+tables; from v1.0 the ones that write are table-aware.
+
+**Which tables each helper touches in 1.0:**
+
+| Helper | Tables | Notes |
+| --- | --- | --- |
+| `delete_records`, `delete_customer_health_data` | `Record` + `SleepDay` + `ActivityDay` (+ workouts / rankings) | One transaction. |
+| `reassign_customer_health_data` | `Record` + `SleepDay` + `ActivityDay` + `Workout` | One transaction. Rebuilds the target's compact rows from `Record`, so **requires `HEALTHDATAMODEL_SAVE_RECORDS = True`**. |
+| `ingest.restore_records` | `Record` + `SleepDay` + `ActivityDay` | One transaction; compact writes use the backfill's replay rules. |
+| `testing.create_record(s)` | `Record` + `SleepDay` + `ActivityDay` | Through `ingest_records`; visible in both read modes. |
+| `has_records`, `get_data_source_summary`, `query.get_sleep_records`, `query.infer_resolution_minutes`, `query.iter_records` | `Record` only | **Require `HEALTHDATAMODEL_SAVE_RECORDS = True`** and only see what your `Record` retention keeps, whatever `HEALTHDATAMODEL_READ_COMPACT` says. |
+| `query.iter_workouts` | `Workout` only | |
 
 | Need | Helper |
 | --- | --- |
@@ -282,15 +303,16 @@ from healthdatamodel.customer_data import (
 
 has_records(customer)  # -> bool
 
-delete_records(customer)  # -> int; records only (workouts/rankings kept)
+delete_records(customer)  # -> int (Record rows); also deletes compact rows
 
 delete_customer_health_data(customer)  # one transaction
-# -> {"records": 120, "workouts": 3, "workout_metadata": 9, "rankings": 8}
+# -> {"records": 120, "sleep_days": 30, "activity_days": 90,
+#     "workouts": 3, "workout_metadata": 9, "rankings": 8}
 delete_customer_health_data(
     customer, rankings=False
-)  # flags: records/workouts/rankings
+)  # flags: records (Record + compact tables) / workouts / rankings
 
-# Account merge: re-point rows (no copy, no de-duplication).
+# Account merge: re-point rows (no copy).
 if not has_records(current) and has_records(existing):
     reassign_customer_health_data(existing, current)  # -> {"records": n, "workouts": n}
 ```
@@ -298,7 +320,15 @@ if not has_records(current) and has_records(existing):
 `delete_customer_health_data` never touches `WearableConnection`.
 `reassign_customer_health_data` moves records and workouts (metadata follows
 its workout) but not `DataSourceRanking` (rebuilt by `ensure_ranks`) or
-`WearableConnection`; pass `workouts=False` to move records only.
+`WearableConnection`; pass `workouts=False` to move records only. `Record`
+rows are not de-duplicated. Compact rows are: where the target already has a
+row for the same sleep `(device, day)` or activity key, the two are merged
+(the newer upload wins, the older one fills empty activity slots), and then
+the target's compact rows are rebuilt from its merged `Record` rows with the
+backfill's replay rules, so the target reads as if every upload had been
+ingested for it. It raises `ImproperlyConfigured` if
+`HEALTHDATAMODEL_SAVE_RECORDS` is `False`, and `ValueError` if both
+arguments are the same customer.
 
 `get_data_source_summary(customer)` returns `dict[str, DataSourceSummary]`
 keyed by data source, covering every source that has records **or** a
@@ -324,7 +354,8 @@ These return frozen `StoredRecord` / `StoredWorkout` dataclasses
 (`healthdatamodel.schemas`), not model instances. They have the familiar
 field names (`startDate`, `endDate`, `value`, `sourceName`, `source`,
 `type`, `unit`, `admin_create_date`, ...) plus `customer_id`, but **no
-primary key** — compact storage has none.
+primary key**. In 1.0 they read `Record` / `Workout` in both read modes, so
+they require `HEALTHDATAMODEL_SAVE_RECORDS = True`.
 
 ```python
 from healthdatamodel.query import (
@@ -369,20 +400,91 @@ It accepts `StoredRecord` objects or mappings (`customer_id` or `customer`,
 plus `startDate`, `endDate`, `creationDate`, `sourceName`, `source`, `value`,
 `type`, `admin_create_date`; optional `unit`, `sourceVersion`, `device`).
 An archived `id` is ignored, NaN in an optional column becomes `NULL`, and
-the iterable is consumed one batch at a time. Wrap the call in
-`transaction.atomic()` if you need all-or-nothing.
+the iterable is consumed one batch at a time. The whole call is one
+transaction (all or nothing).
+
+From 1.0 the restored sleep and activity rows are also written to the
+compact tables (unless `HEALTHDATAMODEL_SAVE_COMPACT = False`), grouped per
+upload `(customer, admin_create_date, source)` and replayed oldest first: a
+restored upload older than what is stored never overwrites newer data
+(activity only fills empty slots), and one with the same `admin_create_date`
+replaces its own earlier write. So repeating a restore leaves the compact
+tables unchanged, although `Record`, which has no unique key, stores the
+rows twice. Pass each upload whole within one call. Its compactable rows
+are kept in memory until the input is exhausted, so restore a large archive
+one customer (or one batch of customers) per call.
 
 ### Ingest notes
 
-`ingest_records` / `ingest_workouts` now return the number of rows saved.
+`ingest_records` returns the number of records submitted and
+`ingest_workouts` the number of workouts saved.
 `ingest_workouts` runs in one transaction and bulk-inserts where the backend
 returns primary keys. `RecordInput.value` accepts plain numbers (e.g. Fitbit
 API values) and stringifies them; negative values are stored as `"0.0"`, as
 negative strings already were.
 
+## Compact storage settings & migration (v1.0)
+
+> **Upgrading an existing install from 0.11.x?** Follow
+> [`docs/UPGRADING-1.0.md`](docs/UPGRADING-1.0.md), a numbered checklist
+> covering settings, migrate, dual-write soak, batched backfill,
+> verification, the per-environment read switch, and rollback.
+
+The defaults are deliberately conservative. A project that sets nothing gets:
+**DDL only** (migration `0011` creates the two empty compact tables, and
+`0012` is a no-op), **dual writes** (every upload goes to both `Record` and
+the compact tables), and **legacy reads** (the query API keeps reading
+`Record`). Switching reads over is an explicit opt-in, made after the backfill
+and verification.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `HEALTHDATAMODEL_SAVE_RECORDS` | `True` | Write every upload through to the legacy `Record` log. This is the rollback path, so keep it on throughout 1.0.x. `reassign_customer_health_data` and the `Record`-reading helpers (`has_records`, `get_data_source_summary`, `get_sleep_records`, `infer_resolution_minutes`, `iter_records`) depend on it. Per-call override: `ingest_records(..., save_records=...)`. |
+| `HEALTHDATAMODEL_SAVE_COMPACT` | `True` | Write every upload to `SleepDay` / `ActivityDay`. |
+| `HEALTHDATAMODEL_READ_COMPACT` | `False` | Serve the query API from the compact tables. Set it to `True` per environment once `compact_status` and `verify_compact` pass. Setting it back to `False` rolls back with no data loss. The legacy path needs PostgreSQL for activity reads. |
+| `HEALTHDATAMODEL_BACKFILL_IN_MIGRATION` | `False` | Let migration `0012` seed the compact tables from `Record` inside the migration transaction. **Only for small installs** (development, demo, CI). |
+
+New installs with no legacy data can set `HEALTHDATAMODEL_READ_COMPACT = True`
+right away. The compact path works on any database backend.
+
+Records the compact schema can't represent (unknown HK types, intervals not
+aligned to a day-dividing grid) are always written to `Record`, even with
+`save_records=False`, so nothing is silently dropped. The package never
+deletes `Record` rows.
+
+### Management commands
+
+```
+# Seed the compact tables from Record. Idempotent, resumable, commits per
+# upload, safe while dual-writes are live.
+python manage.py backfill_compact [--customers PK ... | --customer-range LO HI]
+                                  [--since ISO-DATETIME] [--customer-batch-size 200]
+                                  [--chunk-size 2000] [--progress-every 1000]
+
+# The gate before switching reads: settings, row counts, dual-write lag,
+# per-customer backfill coverage, and a READY / NOT READY verdict.
+python manage.py compact_status [--customers PK ... | --customer-range LO HI]
+                                [--skip-coverage] [--show-pending 20]
+                                [--lag-scan-limit 1000000] [--fail-if-not-ready]
+
+# Parity check: runs the query API in both read modes and diffs per day.
+# Prints PASS / FAIL and exits non-zero on any mismatch.
+python manage.py verify_compact [--sample 20 | --customers PK ...] [--days 30]
+                                [--end YYYY-MM-DD] [--tolerance 0.2]
+                                [--resolutions 15 1440] [--scan-limit 500000]
+                                [--max-report 20]
+```
+
+`verify_compact` compares sleep hours and wake times exactly and activity
+values within `--tolerance` (steps always allow at least 0.5, since they are
+stored as whole numbers). The known differences between the two read paths
+(0.1 kcal rounding, the exact-resolution grid requirement, and others) are
+listed in
+[`docs/UPGRADING-1.0.md`](docs/UPGRADING-1.0.md#known-differences-between-legacy-and-compact-reads).
+
 ## Admin
 
-Admin classes (`WorkoutAdmin`, `RecordAdmin`, `WearableConnectionAdmin`, etc.) are defined in `healthdatamodel.admin` but **not registered** — registration is left to the host project:
+Admin classes (`WorkoutAdmin`, `RecordAdmin`, `SleepDayAdmin`, `ActivityDayAdmin`, `WearableConnectionAdmin`, etc.) are defined in `healthdatamodel.admin` but **not registered** — registration is left to the host project:
 
 ```python
 from django.contrib import admin
@@ -405,9 +507,9 @@ from healthdatamodel.testing import set_customer_device
 set_customer_device(customer, data_source="apple_health", device_brand="apple")
 ```
 
-Create fixture records **through the ingest path** so they stay visible to
-the query API once compact storage lands in v1.0 (records made with
-`Record.objects.create` will not be):
+Create fixture records **through the ingest path** so they are visible to
+the query API in both read modes (records made with `Record.objects.create`
+never reach the compact tables, so compact reads don't see them):
 
 ```python
 from healthdatamodel.testing import create_record, create_records, record_input

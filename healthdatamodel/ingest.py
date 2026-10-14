@@ -28,22 +28,45 @@ Entry points
 
 ``restore_records``
     Re-insert previously archived records verbatim, preserving each row's
-    own ``source``, ``creationDate`` and ``admin_create_date``.
+    own ``source``, ``creationDate`` and ``admin_create_date`` (and, from
+    1.0, replay them into the compact tables).
+
+Compact storage (v1.0)
+----------------------
+All ingest functions also write to the compact tables
+(:class:`~healthdatamodel.models.SleepDay` /
+:class:`~healthdatamodel.models.ActivityDay`) unless
+``settings.HEALTHDATAMODEL_SAVE_COMPACT`` is ``False``.  The legacy
+``Record`` write-through is controlled by the ``save_records`` argument,
+defaulting to ``settings.HEALTHDATAMODEL_SAVE_RECORDS`` (``True``).
+Records the compact schema cannot represent (unknown types, non-grid
+intervals) are written to ``Record`` even when ``save_records`` is off, so
+nothing is ever silently dropped.  Which table the *query* API reads from is
+a separate switch, ``settings.HEALTHDATAMODEL_READ_COMPACT`` (default
+``False``: legacy reads), see :mod:`healthdatamodel.query`.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta, timezone
 from itertools import islice
-from typing import Any
+from typing import Any, NamedTuple
 
+from asgiref.sync import sync_to_async
 from django.db import connections, router, transaction
 
+from healthdatamodel import compact
+from healthdatamodel.compat import COMPACTABLE_TYPES
 from healthdatamodel.models import Record, Workout, WorkoutMetadataEntry
 from healthdatamodel.query import ActivityMetric
 from healthdatamodel.schemas import RecordInput, StoredRecord, WorkoutInput
+
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -110,14 +133,48 @@ def _day_totals_from_records(
 # ---------------------------------------------------------------------------
 
 
+def _records_to_persist(
+    records: list[RecordInput],
+    leftovers: list[RecordInput],
+    save_records: bool,
+    source: str,
+) -> list[RecordInput]:
+    """Pick which records go to the legacy ``Record`` table.
+
+    With ``save_records`` on, everything is written through (unchanged legacy
+    behaviour).  With it off, only uncompactable leftovers are persisted —
+    with a warning, since the caller presumably expected everything to land
+    in the compact tables.
+    """
+    if save_records:
+        return records
+    if leftovers:
+        logger.warning(
+            "healthdatamodel: %d of %d records from source %s could not be "
+            "stored compactly and were written to Record despite "
+            "save_records=False (types: %s)",
+            len(leftovers),
+            len(records),
+            source,
+            sorted({r.type for r in leftovers}),
+        )
+    return leftovers
+
+
 def ingest_records(
     customer: Any,
     records: list[RecordInput],
     source: str,
     admin_create_date: datetime | None = None,
     batch_size: int = 1000,
+    save_records: bool | None = None,
 ) -> int:
     """Save *records* to the database.
+
+    Records are written to the compact tables
+    (:class:`~healthdatamodel.models.SleepDay` /
+    :class:`~healthdatamodel.models.ActivityDay`) and, depending on
+    *save_records*, to the legacy ``Record`` table.
 
     Parameters
     ----------
@@ -133,17 +190,44 @@ def ingest_records(
         Upload timestamp written to all rows.  Defaults to ``now()``.
     batch_size:
         Rows per ``INSERT`` statement.
+    save_records:
+        Write through to the legacy ``Record`` table.  ``None`` (default)
+        falls back to ``settings.HEALTHDATAMODEL_SAVE_RECORDS`` (``True``).
+        Uncompactable records are written to ``Record`` regardless.
 
     Returns
     -------
     int
-        Number of records submitted (``len(records)``).
+        Number of records submitted (``len(records)``), regardless of how
+        many of them were written to ``Record``.
+
+    Notes
+    -----
+    The compact write and the ``Record`` write run in one transaction, so
+    the two storage formats never disagree about whether an upload
+    happened.
     """
     if admin_create_date is None:
         admin_create_date = datetime.now(timezone.utc)
-    models = [_to_django(customer, r, source, admin_create_date) for r in records]
-    Record.objects.bulk_create(models, batch_size=batch_size, ignore_conflicts=True)
-    return len(models)
+    if save_records is None:
+        save_records = compact.save_records_enabled()
+    # Both writers iterate the records; a one-shot iterable would otherwise
+    # be exhausted by the compact write and never reach Record.
+    records = list(records)
+
+    with transaction.atomic(using=router.db_for_write(Record)):
+        leftovers = records
+        if compact.save_compact_enabled():
+            leftovers = compact.apply_compact(
+                customer, records, source, admin_create_date
+            )
+
+        to_persist = _records_to_persist(records, leftovers, save_records, source)
+        models = [
+            _to_django(customer, r, source, admin_create_date) for r in to_persist
+        ]
+        Record.objects.bulk_create(models, batch_size=batch_size, ignore_conflicts=True)
+    return len(records)
 
 
 async def aingest_records(
@@ -152,15 +236,17 @@ async def aingest_records(
     source: str,
     admin_create_date: datetime | None = None,
     batch_size: int = 1000,
+    save_records: bool | None = None,
 ) -> int:
-    """Async variant of :func:`ingest_records` using ``abulk_create``."""
-    if admin_create_date is None:
-        admin_create_date = datetime.now(timezone.utc)
-    models = [_to_django(customer, r, source, admin_create_date) for r in records]
-    await Record.objects.abulk_create(
-        models, batch_size=batch_size, ignore_conflicts=True
+    """Async variant of :func:`ingest_records` (same transaction semantics).
+
+    Runs :func:`ingest_records` in a worker thread via ``sync_to_async``: the
+    compact write needs ``transaction.atomic`` + row locking around both
+    tables, which the async ORM doesn't support.
+    """
+    return await sync_to_async(ingest_records)(
+        customer, records, source, admin_create_date, batch_size, save_records
     )
-    return len(models)
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +441,33 @@ def _restored_to_django(row: StoredRecord | Mapping[str, Any]) -> Record:
     return Record(customer_id=customer_id, **fields)
 
 
+class _RestoredRow(NamedTuple):
+    """The record-shaped fields the compact router needs, kept per restored
+    row until the input is exhausted (lighter than a model instance)."""
+
+    startDate: datetime
+    endDate: datetime
+    sourceName: str
+    value: str
+    unit: str | None
+    type: str
+
+
+def _as_datetime(field: str, value: Any) -> datetime:
+    return Record._meta.get_field(field).to_python(value)
+
+
+def _route_restored(
+    uploads: dict[tuple[Any, datetime, str], list[_RestoredRow]],
+) -> None:
+    """Replay buffered restored uploads into the compact tables, oldest first."""
+    for key in sorted(uploads, key=lambda k: (k[0], k[1], k[2])):
+        customer_id, admin_create_date, source = key
+        compact.apply_compact(
+            customer_id, uploads[key], source, admin_create_date, replay=True
+        )
+
+
 def restore_records(
     records: Iterable[StoredRecord | Mapping[str, Any]],
     batch_size: int = 1000,
@@ -365,8 +478,28 @@ def restore_records(
     ``source``, ``creationDate`` and ``admin_create_date`` — use this when
     restoring rows from an archive (e.g. parquet exported from
     ``healthdatamodel_record``) so that upload-time ordering, which the sleep
-    and activity queries rely on, is preserved.  From v1.0 this also writes
-    the compact storage tables.
+    and activity queries rely on, is preserved.
+
+    Compact storage (1.0)
+        Unless ``HEALTHDATAMODEL_SAVE_COMPACT`` is ``False``, the restored
+        sleep and activity rows are also written to ``SleepDay`` /
+        ``ActivityDay`` through the backfill's replay path
+        (:func:`healthdatamodel.compat.replay_records` semantics): rows are
+        grouped into uploads by ``(customer, admin_create_date, source)``
+        and replayed oldest first, so a restored upload **older** than
+        what is stored never overwrites newer data (activity only fills empty
+        slots), and one with the **same** ``admin_create_date`` as a stored
+        row replaces that upload's earlier write instead of adding to it.
+        The compact tables therefore end up the same however often a
+        restore is repeated.  ``Record`` does not: it has no unique key, so
+        restoring the same rows twice stores them twice (and the legacy
+        read path would count activity twice).
+        An upload must be passed whole within one call, and its compactable
+        rows are held in memory until the input is exhausted; for a large
+        archive call this once per customer or per batch of customers.
+
+    The whole call runs in one transaction: either every row is restored
+    (to ``Record`` and the compact tables) or none is.
 
     Parameters
     ----------
@@ -387,22 +520,45 @@ def restore_records(
     Returns
     -------
     int
-        Number of records inserted.
+        Number of records inserted into ``Record``.
 
     Raises
     ------
     ValueError
-        If a mapping lacks a required field.  Batches already written are
-        not rolled back; wrap the call in ``transaction.atomic()`` for
-        all-or-nothing behaviour.
+        If a mapping lacks a required field.  Nothing is written in that
+        case (the transaction is rolled back).
     """
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1")
+    route = compact.save_compact_enabled()
+    uploads: dict[tuple[Any, datetime, str], list[_RestoredRow]] = defaultdict(list)
     inserted = 0
     rows = iter(records)
-    while batch := [_restored_to_django(r) for r in islice(rows, batch_size)]:
-        Record.objects.bulk_create(batch, batch_size=batch_size)
-        inserted += len(batch)
+    with transaction.atomic(using=router.db_for_write(Record)):
+        while batch := [_restored_to_django(r) for r in islice(rows, batch_size)]:
+            Record.objects.bulk_create(batch, batch_size=batch_size)
+            inserted += len(batch)
+            if not route:
+                continue
+            for rec in batch:
+                if rec.type not in COMPACTABLE_TYPES:
+                    continue
+                key = (
+                    rec.customer_id,
+                    _as_datetime("admin_create_date", rec.admin_create_date),
+                    rec.source,
+                )
+                uploads[key].append(
+                    _RestoredRow(
+                        _as_datetime("startDate", rec.startDate),
+                        _as_datetime("endDate", rec.endDate),
+                        rec.sourceName,
+                        rec.value,
+                        rec.unit,
+                        rec.type,
+                    )
+                )
+        _route_restored(uploads)
     return inserted
 
 
@@ -469,6 +625,7 @@ def ingest_compact_activity(
     return_results: bool = False,
     admin_create_date: datetime | None = None,
     batch_size: int = 1000,
+    save_records: bool | None = None,
 ) -> dict[date, float | None] | None:
     """Expand and save compact activity arrays, optionally returning daily totals.
 
@@ -497,6 +654,9 @@ def ingest_compact_activity(
         Upload timestamp for all rows.  Defaults to ``now()``.
     batch_size:
         Rows per ``INSERT`` statement.
+    save_records:
+        Write through to the legacy ``Record`` table.  ``None`` (default)
+        falls back to ``settings.HEALTHDATAMODEL_SAVE_RECORDS`` (``True``).
 
     Returns
     -------
@@ -506,7 +666,9 @@ def ingest_compact_activity(
     records = expand_compact_activity(
         metric, start, values_by_source, resolution_minutes, unit
     )
-    ingest_records(customer, records, source, admin_create_date, batch_size)
+    ingest_records(
+        customer, records, source, admin_create_date, batch_size, save_records
+    )
     if not return_results:
         return None
     n = max((len(v) for v, _ in values_by_source), default=0)
@@ -527,12 +689,15 @@ async def aingest_compact_activity(
     return_results: bool = False,
     admin_create_date: datetime | None = None,
     batch_size: int = 1000,
+    save_records: bool | None = None,
 ) -> dict[date, float | None] | None:
     """Async variant of :func:`ingest_compact_activity`."""
     records = expand_compact_activity(
         metric, start, values_by_source, resolution_minutes, unit
     )
-    await aingest_records(customer, records, source, admin_create_date, batch_size)
+    await aingest_records(
+        customer, records, source, admin_create_date, batch_size, save_records
+    )
     if not return_results:
         return None
     n = max((len(v) for v, _ in values_by_source), default=0)
