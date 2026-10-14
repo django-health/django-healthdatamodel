@@ -21,16 +21,29 @@ Entry points
     Pass ``return_results=True`` to get daily totals computed in memory
     instead of re-querying the database — useful after single-source ingests
     when no competing sources exist.
+
+``ingest_workouts`` / ``aingest_workouts``
+    Save :class:`~healthdatamodel.schemas.WorkoutInput` objects plus their
+    metadata entries.
+
+``restore_records``
+    Re-insert previously archived records verbatim, preserving each row's
+    own ``source``, ``creationDate`` and ``admin_create_date``.
 """
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta, timezone
+from itertools import islice
 from typing import Any
+
+from django.db import connections, router, transaction
 
 from healthdatamodel.models import Record, Workout, WorkoutMetadataEntry
 from healthdatamodel.query import ActivityMetric
-from healthdatamodel.schemas import RecordInput, WorkoutInput
+from healthdatamodel.schemas import RecordInput, StoredRecord, WorkoutInput
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -103,7 +116,7 @@ def ingest_records(
     source: str,
     admin_create_date: datetime | None = None,
     batch_size: int = 1000,
-) -> None:
+) -> int:
     """Save *records* to the database.
 
     Parameters
@@ -120,11 +133,17 @@ def ingest_records(
         Upload timestamp written to all rows.  Defaults to ``now()``.
     batch_size:
         Rows per ``INSERT`` statement.
+
+    Returns
+    -------
+    int
+        Number of records submitted (``len(records)``).
     """
     if admin_create_date is None:
         admin_create_date = datetime.now(timezone.utc)
     models = [_to_django(customer, r, source, admin_create_date) for r in records]
     Record.objects.bulk_create(models, batch_size=batch_size, ignore_conflicts=True)
+    return len(models)
 
 
 async def aingest_records(
@@ -133,7 +152,7 @@ async def aingest_records(
     source: str,
     admin_create_date: datetime | None = None,
     batch_size: int = 1000,
-) -> None:
+) -> int:
     """Async variant of :func:`ingest_records` using ``abulk_create``."""
     if admin_create_date is None:
         admin_create_date = datetime.now(timezone.utc)
@@ -141,6 +160,7 @@ async def aingest_records(
     await Record.objects.abulk_create(
         models, batch_size=batch_size, ignore_conflicts=True
     )
+    return len(models)
 
 
 # ---------------------------------------------------------------------------
@@ -208,18 +228,24 @@ def _workout_to_django(
     )
 
 
+def _can_bulk_return_pks() -> bool:
+    db = router.db_for_write(Workout)
+    return connections[db].features.can_return_rows_from_bulk_insert
+
+
 def ingest_workouts(
     customer: Any,
     workouts: list[WorkoutInput],
     source: str,
     batch_size: int = 1000,
-) -> None:
+) -> int:
     """Save *workouts* to the database.
 
     Mirrors :func:`ingest_records`. Persists each ``WorkoutInput`` as one
     ``Workout`` row plus ``WorkoutMetadataEntry`` rows for the caller-supplied
-    metadata and for the ``caloriesBurned`` / ``distance`` fields that don't
-    have first-class columns on ``Workout``.
+    metadata and for the ``caloriesBurned`` / ``caloriesUnit`` / ``distance``
+    / ``distanceUnit`` fields that don't have first-class columns on
+    ``Workout``.  ``duration`` is truncated to an integer (the column type).
 
     Parameters
     ----------
@@ -231,21 +257,34 @@ def ingest_workouts(
         The data-pipeline identifier for all workouts (e.g.
         ``DataSource.APPLE_HEALTH``).  Stored in ``Workout.source``.
     batch_size:
-        Rows per ``INSERT`` statement when bulk-creating the metadata entries.
+        Rows per ``INSERT`` statement.
+
+    Returns
+    -------
+    int
+        Number of workouts saved.
 
     Notes
     -----
-    Workouts are inserted one-at-a-time so the auto-generated primary keys are
-    available immediately for the metadata FK. Metadata entries are then
-    bulk-inserted in a single statement per ``batch_size``.
+    Runs in a single transaction: either every workout and metadata entry is
+    saved or none is.  On backends that return primary keys from bulk
+    inserts (PostgreSQL, SQLite ≥ 3.35, MariaDB ≥ 10.5) workouts are
+    bulk-inserted; elsewhere they are saved one at a time so the keys are
+    available for the metadata foreign key.
     """
-    metadata: list[WorkoutMetadataEntry] = []
-    for workout_input in workouts:
-        workout = _workout_to_django(customer, workout_input, source)
-        workout.save()
-        metadata.extend(_workout_metadata_entries(workout, workout_input))
-    if metadata:
-        WorkoutMetadataEntry.objects.bulk_create(metadata, batch_size=batch_size)
+    with transaction.atomic(using=router.db_for_write(Workout)):
+        objs = [_workout_to_django(customer, w, source) for w in workouts]
+        if _can_bulk_return_pks():
+            Workout.objects.bulk_create(objs, batch_size=batch_size)
+        else:
+            for obj in objs:
+                obj.save()
+        metadata: list[WorkoutMetadataEntry] = []
+        for obj, workout_input in zip(objs, workouts, strict=True):
+            metadata.extend(_workout_metadata_entries(obj, workout_input))
+        if metadata:
+            WorkoutMetadataEntry.objects.bulk_create(metadata, batch_size=batch_size)
+    return len(objs)
 
 
 async def aingest_workouts(
@@ -253,15 +292,118 @@ async def aingest_workouts(
     workouts: list[WorkoutInput],
     source: str,
     batch_size: int = 1000,
-) -> None:
-    """Async variant of :func:`ingest_workouts`."""
-    metadata: list[WorkoutMetadataEntry] = []
-    for workout_input in workouts:
-        workout = _workout_to_django(customer, workout_input, source)
-        await workout.asave()
-        metadata.extend(_workout_metadata_entries(workout, workout_input))
-    if metadata:
-        await WorkoutMetadataEntry.objects.abulk_create(metadata, batch_size=batch_size)
+) -> int:
+    """Async variant of :func:`ingest_workouts` (same transaction semantics)."""
+    from asgiref.sync import sync_to_async
+
+    return await sync_to_async(ingest_workouts)(customer, workouts, source, batch_size)
+
+
+# ---------------------------------------------------------------------------
+# Public API — restore archived records
+# ---------------------------------------------------------------------------
+
+_RESTORE_REQUIRED = (
+    "startDate",
+    "endDate",
+    "creationDate",
+    "sourceName",
+    "source",
+    "value",
+    "type",
+    "admin_create_date",
+)
+_RESTORE_OPTIONAL = ("unit", "sourceVersion", "device")
+
+
+def _missing(value: Any) -> bool:
+    """``None`` or a float NaN (what pandas puts in empty parquet cells)."""
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
+def _restored_to_django(row: StoredRecord | Mapping[str, Any]) -> Record:
+    if isinstance(row, StoredRecord):
+        return Record(
+            customer_id=row.customer_id,
+            startDate=row.startDate,
+            endDate=row.endDate,
+            creationDate=row.creationDate,
+            sourceVersion=row.sourceVersion,
+            sourceName=row.sourceName,
+            source=row.source,
+            value=row.value,
+            unit=row.unit,
+            type=row.type,
+            device=row.device,
+            admin_create_date=row.admin_create_date,
+        )
+    if "customer_id" in row and not _missing(row["customer_id"]):
+        customer_id = int(row["customer_id"])
+    elif "customer" in row and not _missing(row["customer"]):
+        customer = row["customer"]
+        customer_id = int(getattr(customer, "pk", customer))
+    else:
+        raise ValueError("restore row has neither 'customer_id' nor 'customer'")
+    missing = [k for k in _RESTORE_REQUIRED if k not in row or _missing(row[k])]
+    if missing:
+        raise ValueError(f"restore row is missing required field(s): {missing}")
+    fields: dict[str, Any] = {k: row[k] for k in _RESTORE_REQUIRED}
+    fields["value"] = str(fields["value"])
+    for k in _RESTORE_OPTIONAL:
+        v = row.get(k)
+        fields[k] = None if _missing(v) else v
+    return Record(customer_id=customer_id, **fields)
+
+
+def restore_records(
+    records: Iterable[StoredRecord | Mapping[str, Any]],
+    batch_size: int = 1000,
+) -> int:
+    """Re-insert archived records exactly as they were stored.
+
+    Unlike :func:`ingest_records`, every row keeps its **own** customer,
+    ``source``, ``creationDate`` and ``admin_create_date`` — use this when
+    restoring rows from an archive (e.g. parquet exported from
+    ``healthdatamodel_record``) so that upload-time ordering, which the sleep
+    and activity queries rely on, is preserved.  From v1.0 this also writes
+    the compact storage tables.
+
+    Parameters
+    ----------
+    records:
+        Any iterable (consumed lazily, one batch at a time) of
+        :class:`~healthdatamodel.schemas.StoredRecord` objects or mappings
+        such as ``DataFrame.to_dict("records")`` rows.  A mapping needs
+        ``customer_id`` (or ``customer``: an id or a user instance),
+        ``startDate``, ``endDate``, ``creationDate``, ``sourceName``,
+        ``source``, ``value``, ``type`` and ``admin_create_date``; ``unit``,
+        ``sourceVersion`` and ``device`` are optional.  Other keys (e.g. an
+        archived ``id``) are ignored — new primary keys are assigned.  NaN in
+        an optional column is stored as ``NULL``; ``value`` is stringified.
+        Datetimes should be timezone-aware.
+    batch_size:
+        Rows per ``INSERT`` statement.
+
+    Returns
+    -------
+    int
+        Number of records inserted.
+
+    Raises
+    ------
+    ValueError
+        If a mapping lacks a required field.  Batches already written are
+        not rolled back; wrap the call in ``transaction.atomic()`` for
+        all-or-nothing behaviour.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    inserted = 0
+    rows = iter(records)
+    while batch := [_restored_to_django(r) for r in islice(rows, batch_size)]:
+        Record.objects.bulk_create(batch, batch_size=batch_size)
+        inserted += len(batch)
+    return inserted
 
 
 # ---------------------------------------------------------------------------

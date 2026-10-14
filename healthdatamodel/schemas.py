@@ -8,6 +8,7 @@ an internal implementation detail — callers never interact with them directly.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import dateutil.parser
@@ -57,7 +58,12 @@ class RecordInput(BaseModel):
         Accepts ``1.233,45`` (European) and ``1,233.45`` (US grouped) and
         normalises both to ``1233.45``.  Negative strings are coerced to
         ``"0.0"`` since health records cannot be negative.
+
+        Plain ``int`` / ``float`` values (e.g. Fitbit API numbers) are
+        accepted and stringified first, so callers need not ``str()`` them.
         """
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            value = str(value)
         if isinstance(value, str) and "," in value:
             if value[-3] == ",":
                 return value.replace(".", "").replace(",", ".")
@@ -100,3 +106,55 @@ class WorkoutInput(BaseModel):
         if isinstance(value, str):
             return float(value)
         return value
+
+
+# ---------------------------------------------------------------------------
+# Read-side value objects
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StoredRecord:
+    """A health record as returned by the read helpers.
+
+    Returned by :func:`healthdatamodel.query.get_sleep_records` and
+    :func:`healthdatamodel.query.iter_records`, and accepted by
+    :func:`healthdatamodel.ingest.restore_records`.  It deliberately carries
+    no primary key: from v1.0 records may be served from compact storage,
+    where individual rows have no stable id.  Treat it as a read-only value.
+    """
+
+    customer_id: int
+    startDate: datetime
+    endDate: datetime
+    creationDate: datetime
+    sourceName: str
+    source: str
+    value: str
+    type: str
+    admin_create_date: datetime
+    unit: str | None = None
+    sourceVersion: str | None = None
+    device: str | None = None
+
+
+@dataclass(frozen=True)
+class StoredWorkout:
+    """A workout as returned by :func:`healthdatamodel.query.iter_workouts`.
+
+    Metadata entries are not included; like :class:`StoredRecord` it has no
+    primary key and is a read-only value.
+    """
+
+    customer_id: int
+    startDate: datetime
+    endDate: datetime
+    creationDate: datetime
+    sourceName: str
+    source: str
+    durationUnit: str
+    duration: int
+    workoutActivityType: str
+    admin_create_date: datetime
+    sourceVersion: str | None = None
+    device: str | None = None

@@ -21,10 +21,16 @@ from healthdatamodel.ingest import (
     ingest_compact_activity,
     ingest_records,
     ingest_workouts,
+    restore_records,
 )
 from healthdatamodel.models import Record, Workout, WorkoutMetadataEntry
 from healthdatamodel.query import ActivityMetric, get_activity_by_day_from_records
-from healthdatamodel.schemas import MetadataEntry, RecordInput, WorkoutInput
+from healthdatamodel.schemas import (
+    MetadataEntry,
+    RecordInput,
+    StoredRecord,
+    WorkoutInput,
+)
 
 User = get_user_model()
 
@@ -505,3 +511,186 @@ class TestIngestWorkouts:
             async for key in WorkoutMetadataEntry.objects.values_list("key", flat=True)
         }
         assert {"route", "caloriesBurned", "caloriesUnit"} <= keys
+
+    def test_returns_count_and_metadata_maps_to_its_own_workout(self, customer):
+        workouts = [
+            _workout(
+                WEEK_START + timedelta(hours=i),
+                WEEK_START + timedelta(hours=i, minutes=20),
+                activity=f"A{i}",
+                metadata=[MetadataEntry(key="idx", value=str(i))],
+            )
+            for i in range(3)
+        ]
+        assert ingest_workouts(customer, workouts, source=DataSource.APPLE_HEALTH) == 3
+        for w in Workout.objects.filter(customer=customer):
+            entry = WorkoutMetadataEntry.objects.get(workout=w)
+            assert w.workoutActivityType == f"A{entry.value}"
+
+    def test_persists_source_version_device_and_duration_unit(self, customer):
+        w = _workout(WEEK_START, WEEK_START + timedelta(minutes=30)).model_copy(
+            update={
+                "sourceVersion": "17.1",
+                "device": "<<HKDevice: Apple Watch>>",
+                "durationUnit": "min",
+                "duration": 30.9,
+            }
+        )
+        ingest_workouts(customer, [w], source=DataSource.APPLE_HEALTH)
+        row = Workout.objects.get(customer=customer)
+        assert row.sourceVersion == "17.1"
+        assert row.device == "<<HKDevice: Apple Watch>>"
+        assert row.durationUnit == "min"
+        assert row.duration == 30  # truncated to the integer column
+
+    def test_is_atomic(self, customer, monkeypatch):
+        def boom(*args, **kwargs):
+            raise RuntimeError("metadata insert failed")
+
+        monkeypatch.setattr(WorkoutMetadataEntry.objects, "bulk_create", boom)
+        with pytest.raises(RuntimeError):
+            ingest_workouts(
+                customer,
+                [
+                    _workout(
+                        WEEK_START,
+                        WEEK_START + timedelta(minutes=5),
+                        metadata=[MetadataEntry(key="k", value="v")],
+                    )
+                ],
+                source=DataSource.APPLE_HEALTH,
+            )
+        assert not Workout.objects.filter(customer=customer).exists()
+
+    def test_falls_back_to_per_row_save(self, customer, monkeypatch):
+        import healthdatamodel.ingest as ingest_mod
+
+        monkeypatch.setattr(ingest_mod, "_can_bulk_return_pks", lambda: False)
+        n = ingest_workouts(
+            customer,
+            [
+                _workout(
+                    WEEK_START,
+                    WEEK_START + timedelta(minutes=5),
+                    metadata=[MetadataEntry(key="k", value="v")],
+                )
+            ],
+            source=DataSource.APPLE_HEALTH,
+        )
+        assert n == 1
+        assert WorkoutMetadataEntry.objects.get(workout__customer=customer).key == "k"
+
+
+class TestRecordInputNumericValue:
+    def test_int_and_float_values_are_stringified(self):
+        assert _record(WEEK_START, WEEK_START, 512).value == "512"  # type: ignore[arg-type]
+        assert _record(WEEK_START, WEEK_START, 12.5).value == "12.5"  # type: ignore[arg-type]
+
+    def test_negative_number_clamped_like_negative_string(self):
+        assert _record(WEEK_START, WEEK_START, -3).value == "0.0"  # type: ignore[arg-type]
+
+    def test_ingest_records_returns_count(self, customer):
+        n = ingest_records(
+            customer,
+            [_record(WEEK_START, WEEK_START + timedelta(days=1), "1")] * 2,
+            source=DataSource.FITBIT,
+        )
+        assert n == 2
+
+
+# ---------------------------------------------------------------------------
+# restore_records
+# ---------------------------------------------------------------------------
+
+
+def _archived_row(customer_id: int, **overrides):
+    row = {
+        "id": 999_999,  # archived PK, must be ignored
+        "customer_id": customer_id,
+        "startDate": WEEK_START,
+        "endDate": WEEK_START + timedelta(minutes=15),
+        "creationDate": datetime(2024, 5, 1, tzinfo=timezone.utc),
+        "sourceVersion": float("nan"),
+        "sourceName": "Apple Watch",
+        "source": DataSource.APPLE_HEALTH.value,
+        "value": 42,
+        "unit": "count",
+        "type": ActivityMetric.STEPS.value,
+        "device": None,
+        "admin_create_date": datetime(2024, 5, 2, 3, 4, tzinfo=timezone.utc),
+    }
+    row.update(overrides)
+    return row
+
+
+class TestRestoreRecords:
+    def test_preserves_per_row_fields(self, customer):
+        other = User.objects.create_user(username="restore-other")
+        acd2 = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        n = restore_records(
+            [
+                _archived_row(customer.pk),
+                _archived_row(
+                    other.pk, source=DataSource.FITBIT.value, admin_create_date=acd2
+                ),
+            ]
+        )
+        assert n == 2
+        mine = Record.objects.get(customer=customer)
+        assert mine.pk != 999_999
+        assert mine.admin_create_date == datetime(2024, 5, 2, 3, 4, tzinfo=timezone.utc)
+        assert mine.creationDate == datetime(2024, 5, 1, tzinfo=timezone.utc)
+        assert mine.source == DataSource.APPLE_HEALTH
+        assert mine.value == "42"
+        assert mine.sourceVersion is None  # NaN -> NULL
+        theirs = Record.objects.get(customer=other)
+        assert theirs.source == DataSource.FITBIT
+        assert theirs.admin_create_date == acd2
+
+    def test_accepts_customer_instance_or_id_under_customer_key(self, customer):
+        row1 = _archived_row(customer.pk)
+        row1.pop("customer_id")
+        row1["customer"] = customer
+        row2 = _archived_row(customer.pk)
+        row2.pop("customer_id")
+        row2["customer"] = customer.pk
+        assert restore_records([row1, row2]) == 2
+        assert Record.objects.filter(customer=customer).count() == 2
+
+    def test_accepts_stored_records_round_trip(self, customer):
+        from healthdatamodel.query import iter_records
+
+        restore_records([_archived_row(customer.pk, unit=None)])
+        stored = list(iter_records(customer))
+        assert isinstance(stored[0], StoredRecord)
+        Record.objects.all().delete()
+        assert restore_records(stored) == 1
+        assert list(iter_records(customer)) == stored
+
+    def test_batches_lazily_from_a_generator(self, customer):
+        rows = (
+            _archived_row(customer.pk, startDate=WEEK_START + timedelta(minutes=i))
+            for i in range(7)
+        )
+        assert restore_records(rows, batch_size=3) == 7
+        assert Record.objects.filter(customer=customer).count() == 7
+
+    def test_empty_input(self):
+        assert restore_records([]) == 0
+
+    @pytest.mark.parametrize("missing", ["admin_create_date", "source", "startDate"])
+    def test_missing_required_field_raises(self, customer, missing):
+        row = _archived_row(customer.pk)
+        row[missing] = None
+        with pytest.raises(ValueError, match=missing):
+            restore_records([row])
+
+    def test_missing_customer_raises(self, customer):
+        row = _archived_row(customer.pk)
+        row.pop("customer_id")
+        with pytest.raises(ValueError, match="customer"):
+            restore_records([row])
+
+    def test_bad_batch_size(self):
+        with pytest.raises(ValueError):
+            restore_records([], batch_size=0)
