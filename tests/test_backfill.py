@@ -282,6 +282,47 @@ class TestReplayIdempotency:
         backfill_from_records()
         assert get_sleep_hours_by_day(customer, TODAY, TODAY)[TODAY] == 8.0
 
+    def test_sleep_same_timestamp_two_sources_unioned(self, customer, legacy_only):
+        # Two pipelines wrote the same device's night at the same timestamp.
+        # Live ingest merges same-timestamp writes and the legacy read counts
+        # every record at the winning timestamp, so the replay (one group per
+        # source) must union them, and re-runs must stay stable.
+        night_start = datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc)
+        for source, start, end in (
+            (DataSource.APPLE_HEALTH, night_start, night_start + timedelta(hours=4)),
+            (
+                DataSource.FITBIT,
+                night_start + timedelta(hours=4),
+                night_start + timedelta(hours=8),
+            ),
+        ):
+            ingest_records(
+                customer,
+                [
+                    RecordInput(
+                        startDate=start,
+                        endDate=end,
+                        creationDate=NOW,
+                        sourceName="apple",
+                        value=ASLEEP,
+                        type=SLEEP_TYPE,
+                    )
+                ],
+                source=source,
+                admin_create_date=NOW,
+            )
+        from django.test.utils import override_settings
+
+        with override_settings(HEALTHDATAMODEL_READ_COMPACT=False):
+            legacy = get_sleep_hours_by_day(customer, TODAY, TODAY)[TODAY]
+        assert legacy == 8.0
+        backfill_from_records()
+        first = SleepDay.objects.get(customer=customer).intervals
+        backfill_from_records()
+        assert SleepDay.objects.get(customer=customer).intervals == first
+        with override_settings(HEALTHDATAMODEL_READ_COMPACT=True):
+            assert get_sleep_hours_by_day(customer, TODAY, TODAY)[TODAY] == legacy
+
 
 class TestReplayNeverRegresses:
     """A replayed upload older than the stored row (e.g. a live upload landed

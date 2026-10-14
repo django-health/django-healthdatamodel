@@ -5,12 +5,15 @@ The parity gate before switching reads to the compact tables
 recent uploads (or ``--customers``), runs the public query API with
 ``READ_COMPACT`` forced to True and then to False, and diffs, per day:
 
-* sleep — ``get_sleep_by_day`` hours (within ``--tolerance``) and wake time
-  (exact);
+* sleep — ``get_sleep_by_day`` hours and wake time, both **exactly**
+  (compact sleep intervals are stored at full precision, so any difference
+  is a real one);
 * activity — for each metric, ``get_activity_by_day`` (daily records,
   ``1440``) and ``get_activity_records`` at each other ``--resolutions``
   value, compared slot by slot after summing tied rows (legacy returns one
-  tuple per tied device row, compact one pre-summed tuple per slot).
+  tuple per tied device row, compact one pre-summed tuple per slot), within
+  ``--tolerance`` per value.  Steps are stored as whole numbers, so for
+  steps the tolerance is at least 0.5.
 
 Prints a per-check table and a final ``PASS`` / ``FAIL`` line; exits
 non-zero on any mismatch.  The legacy activity path requires PostgreSQL; on
@@ -37,11 +40,24 @@ from healthdatamodel.query import (
 
 _SCAN_PAGE = 5000
 
+#: Absolute slack for float noise in "exact" comparisons (sleep hours).
+_EXACT = 1e-9
+
+#: Compact steps are rounded to whole numbers at write time, so a stored
+#: step value can differ from the raw legacy value by up to 0.5.
+_STEPS_ROUNDING = 0.5
+
 
 def _approx_equal(a, b, tolerance: float) -> bool:
     if a is None or b is None:
         return a is b
     return abs(a - b) <= tolerance
+
+
+def _metric_tolerance(metric: ActivityMetric, tolerance: float) -> float:
+    if metric == ActivityMetric.STEPS:
+        return max(tolerance, _STEPS_ROUNDING)
+    return tolerance
 
 
 def recent_customer_ids(sample: int, scan_limit: int) -> list:
@@ -113,8 +129,9 @@ class Command(BaseCommand):
             "--tolerance",
             type=float,
             default=0.2,
-            help="Numeric tolerance per value; compact energy values are "
-            "rounded to 0.1 kcal at write time (default 0.2).",
+            help="Numeric tolerance per activity value; compact energy "
+            "values are rounded to 0.1 kcal at write time (default 0.2; "
+            "steps always allow at least 0.5, sleep is compared exactly).",
         )
         parser.add_argument(
             "--resolutions",
@@ -178,14 +195,20 @@ class Command(BaseCommand):
             f"({options['days']} days), tolerance {tolerance}"
         )
         for customer in customers:
-            self._compare_sleep(customer, start, end, tolerance, checks["sleep"])
+            self._compare_sleep(customer, start, end, checks["sleep"])
             if not activity_supported:
                 continue
             for metric in ActivityMetric:
                 for resolution in options["resolutions"]:
                     stats = checks[f"{metric.name}@{resolution}min"]
                     self._compare_activity(
-                        customer, metric, resolution, start, end, tolerance, stats
+                        customer,
+                        metric,
+                        resolution,
+                        start,
+                        end,
+                        _metric_tolerance(metric, tolerance),
+                        stats,
                     )
 
         self.stdout.write(
@@ -222,7 +245,7 @@ class Command(BaseCommand):
             self.stdout.write("  ... (further mismatches not shown; see --max-report)")
         self._reported += 1
 
-    def _compare_sleep(self, customer, start, end, tolerance, stats):
+    def _compare_sleep(self, customer, start, end, stats):
         with override_settings(HEALTHDATAMODEL_READ_COMPACT=True):
             compact = get_sleep_by_day(customer, start, end)
         with override_settings(HEALTHDATAMODEL_READ_COMPACT=False):
@@ -232,7 +255,7 @@ class Command(BaseCommand):
             stats.days += 1
             if comp.hours is not None or leg.hours is not None:
                 stats.with_data += 1
-            if not _approx_equal(comp.hours, leg.hours, tolerance) or (
+            if not _approx_equal(comp.hours, leg.hours, _EXACT) or (
                 comp.wake_time != leg.wake_time
             ):
                 stats.mismatched += 1

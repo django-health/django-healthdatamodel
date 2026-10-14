@@ -45,7 +45,7 @@ Entry points
 ``replay_records``
     Replay any iterable of record-shaped objects (e.g. rows loaded from an
     archive of the ``Record`` table).  The iterable must be sorted by
-    ``(customer_id, admin_create_date)``.
+    ``(customer_id, admin_create_date, source)``.
 """
 
 from __future__ import annotations
@@ -110,9 +110,11 @@ def replay_records(
 ) -> tuple[int, int]:
     """Replay record-shaped objects through the compact router.
 
-    *records* must be sorted by ``(customer_id, admin_create_date)`` so that
-    newer uploads overwrite older ones, exactly as live dual-writing would
-    have.  Each object needs ``customer_id``, ``admin_create_date``,
+    *records* must be sorted by ``(customer_id, admin_create_date, source)``
+    so that newer uploads overwrite older ones, exactly as live dual-writing
+    would have, and each upload arrives as one contiguous group (an upload
+    split into two groups would be replayed twice at the same timestamp, and
+    the second group would replace the first).  Each object needs ``customer_id``, ``admin_create_date``,
     ``source``, and the record-shaped attributes used by the router
     (``startDate``, ``endDate``, ``sourceName``, ``value``, ``unit``,
     ``type``).

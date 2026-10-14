@@ -7,11 +7,14 @@ All tests run against SQLite (:memory:).
 
 from __future__ import annotations
 
+import threading
+import time as time_mod
 from datetime import date, datetime, time, timedelta, timezone
 from itertools import pairwise
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.db import connection, transaction
 
 from healthdatamodel.compact import split_sleep_interval
 from healthdatamodel.constants import CompactMetric, DataSource, SleepStage
@@ -510,3 +513,131 @@ class TestSaveRecordsFlag:
         settings.HEALTHDATAMODEL_SAVE_RECORDS = False
         ingest_records(customer, [self._night()], source=DataSource.APPLE_HEALTH)
         assert Record.objects.count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Transactions and concurrency
+# ---------------------------------------------------------------------------
+
+
+class TestDualWriteAtomicity:
+    def test_one_shot_iterable_reaches_both_tables(self, customer):
+        records = iter(
+            [_activity_input(MIDNIGHT, MIDNIGHT + timedelta(minutes=15), "10")]
+        )
+        assert ingest_records(customer, records, source=DataSource.APPLE_HEALTH) == 1
+        assert Record.objects.count() == 1
+        assert ActivityDay.objects.count() == 1
+
+    def test_record_failure_rolls_back_compact_write(self, customer, monkeypatch):
+        def boom(*args, **kwargs):
+            raise RuntimeError("Record insert failed")
+
+        monkeypatch.setattr(Record.objects, "bulk_create", boom)
+        with pytest.raises(RuntimeError):
+            ingest_records(
+                customer,
+                [
+                    _activity_input(MIDNIGHT, MIDNIGHT + timedelta(minutes=15), "10"),
+                    _sleep_input(
+                        datetime.combine(YESTERDAY, time(23)).replace(
+                            tzinfo=timezone.utc
+                        ),
+                        datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
+                    ),
+                ],
+                source=DataSource.APPLE_HEALTH,
+            )
+        assert not ActivityDay.objects.exists()
+        assert not SleepDay.objects.exists()
+
+
+@pytest.mark.skipif(
+    connection.vendor != "postgresql", reason="row locking needs PostgreSQL"
+)
+@pytest.mark.django_db(transaction=True)
+class TestConcurrentFirstWrites:
+    """Two transactions creating the same new compact key concurrently must
+    serialise, not overwrite each other (no lost update)."""
+
+    def _race(self, first, second):
+        from healthdatamodel.compact import apply_compact
+
+        inside = threading.Event()
+        release = threading.Event()
+        errors: list[Exception] = []
+
+        def writer_a():
+            try:
+                with transaction.atomic():
+                    apply_compact(*first)
+                    inside.set()
+                    release.wait(10)
+            except Exception as exc:  # noqa: BLE001 - re-raised via the assert below
+                errors.append(exc)
+                inside.set()
+            finally:
+                connection.close()
+
+        def writer_b():
+            try:
+                inside.wait(10)
+                apply_compact(*second)
+            except Exception as exc:  # noqa: BLE001 - re-raised via the assert below
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        a = threading.Thread(target=writer_a)
+        b = threading.Thread(target=writer_b)
+        a.start()
+        b.start()
+        inside.wait(10)
+        time_mod.sleep(0.5)  # let B reach the key A holds uncommitted
+        release.set()
+        a.join(20)
+        b.join(20)
+        assert not errors, errors
+
+    def test_activity_new_day(self):
+        user = User.objects.create_user(username="race-activity")
+        slot0 = _activity_input(MIDNIGHT, MIDNIGHT + timedelta(minutes=15), "10")
+        slot1 = _activity_input(
+            MIDNIGHT + timedelta(minutes=15), MIDNIGHT + timedelta(minutes=30), "20"
+        )
+        self._race(
+            (user.pk, [slot0], DataSource.APPLE_HEALTH, NOW),
+            (user.pk, [slot1], DataSource.APPLE_HEALTH, NOW + timedelta(hours=1)),
+        )
+        row = ActivityDay.objects.get(customer=user)
+        assert row.values[:2] == [10.0, 20.0]
+        assert row.admin_create_date == NOW + timedelta(hours=1)
+
+    def test_sleep_new_day_same_upload(self):
+        user = User.objects.create_user(username="race-sleep")
+        first = _sleep_input(
+            datetime.combine(YESTERDAY, time(23)).replace(tzinfo=timezone.utc),
+            datetime.combine(TODAY, time(3)).replace(tzinfo=timezone.utc),
+        )
+        second = _sleep_input(
+            datetime.combine(TODAY, time(3)).replace(tzinfo=timezone.utc),
+            datetime.combine(TODAY, time(7)).replace(tzinfo=timezone.utc),
+        )
+        # One upload delivered in two concurrent calls: must merge.
+        self._race(
+            (user.pk, [first], DataSource.APPLE_HEALTH, NOW),
+            (user.pk, [second], DataSource.APPLE_HEALTH, NOW),
+        )
+        assert len(SleepDay.objects.get(customer=user).intervals) == 2
+
+    def test_no_placeholder_rows_left_behind(self):
+        user = User.objects.create_user(username="race-placeholder")
+        ingest_records(
+            user,
+            [_activity_input(MIDNIGHT, MIDNIGHT + timedelta(minutes=15), "10")],
+            source=DataSource.APPLE_HEALTH,
+            admin_create_date=NOW,
+        )
+        assert not ActivityDay.objects.filter(
+            admin_create_date__lt=datetime(2000, 1, 1, tzinfo=timezone.utc)
+        ).exists()

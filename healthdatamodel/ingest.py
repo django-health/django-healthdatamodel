@@ -197,19 +197,33 @@ def ingest_records(
     int
         Number of records submitted (``len(records)``), regardless of how
         many of them were written to ``Record``.
+
+    Notes
+    -----
+    The compact write and the ``Record`` write run in one transaction, so
+    the two storage formats never disagree about whether an upload
+    happened.
     """
     if admin_create_date is None:
         admin_create_date = datetime.now(timezone.utc)
     if save_records is None:
         save_records = compact.save_records_enabled()
+    # Both writers iterate the records; a one-shot iterable would otherwise
+    # be exhausted by the compact write and never reach Record.
+    records = list(records)
 
-    leftovers = list(records)
-    if compact.save_compact_enabled():
-        leftovers = compact.apply_compact(customer, records, source, admin_create_date)
+    with transaction.atomic(using=router.db_for_write(Record)):
+        leftovers = records
+        if compact.save_compact_enabled():
+            leftovers = compact.apply_compact(
+                customer, records, source, admin_create_date
+            )
 
-    to_persist = _records_to_persist(records, leftovers, save_records, source)
-    models = [_to_django(customer, r, source, admin_create_date) for r in to_persist]
-    Record.objects.bulk_create(models, batch_size=batch_size, ignore_conflicts=True)
+        to_persist = _records_to_persist(records, leftovers, save_records, source)
+        models = [
+            _to_django(customer, r, source, admin_create_date) for r in to_persist
+        ]
+        Record.objects.bulk_create(models, batch_size=batch_size, ignore_conflicts=True)
     return len(records)
 
 
@@ -221,29 +235,15 @@ async def aingest_records(
     batch_size: int = 1000,
     save_records: bool | None = None,
 ) -> int:
-    """Async variant of :func:`ingest_records` using ``abulk_create``.
+    """Async variant of :func:`ingest_records` (same transaction semantics).
 
-    The compact write runs in a thread via ``sync_to_async`` (it needs
-    ``transaction.atomic`` + row locking, which the async ORM doesn't
-    support yet).
+    Runs :func:`ingest_records` in a worker thread via ``sync_to_async``: the
+    compact write needs ``transaction.atomic`` + row locking around both
+    tables, which the async ORM doesn't support.
     """
-    if admin_create_date is None:
-        admin_create_date = datetime.now(timezone.utc)
-    if save_records is None:
-        save_records = compact.save_records_enabled()
-
-    leftovers = list(records)
-    if compact.save_compact_enabled():
-        leftovers = await sync_to_async(compact.apply_compact)(
-            customer, records, source, admin_create_date
-        )
-
-    to_persist = _records_to_persist(records, leftovers, save_records, source)
-    models = [_to_django(customer, r, source, admin_create_date) for r in to_persist]
-    await Record.objects.abulk_create(
-        models, batch_size=batch_size, ignore_conflicts=True
+    return await sync_to_async(ingest_records)(
+        customer, records, source, admin_create_date, batch_size, save_records
     )
-    return len(records)
 
 
 # ---------------------------------------------------------------------------

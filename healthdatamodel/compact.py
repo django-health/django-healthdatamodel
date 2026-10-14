@@ -257,11 +257,55 @@ def _customer_pk(customer: Any) -> Any:
     return customer.pk if hasattr(customer, "pk") else customer
 
 
+def _write_db() -> str:
+    """Database alias the compact tables are written to (router-aware)."""
+    return router.db_for_write(SleepDay)
+
+
+def _can_lock() -> bool:
+    return connections[_write_db()].features.has_select_for_update
+
+
 def _lock_if_supported(queryset):
-    model = queryset.model
-    if connections[router.db_for_write(model)].features.has_select_for_update:
+    if _can_lock():
         return queryset.select_for_update()
     return queryset
+
+
+#: ``admin_create_date`` of the empty rows :func:`_ensure_rows` inserts so
+#: that every key can be row-locked.  They are always overwritten in the same
+#: transaction, so they never become visible to other connections.
+_PLACEHOLDER_DATE = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _ensure_rows(model: Any, rows: list[Any], sort_fields: list[str]) -> None:
+    """Insert *rows* (empty placeholders) where their key does not exist yet.
+
+    ``SELECT ... FOR UPDATE`` can only lock rows that exist.  Without this,
+    two transactions writing the same *new* key concurrently (two uploads in
+    flight for one customer, or the backfill replaying an old upload while a
+    live upload creates the same day) would both read "no row", and the
+    later ``INSERT ... ON CONFLICT DO UPDATE`` would overwrite the earlier
+    commit with a vector / interval list that lacks its data.  Inserting the
+    keys first (``ON CONFLICT DO NOTHING``) makes the second transaction
+    wait on the unique index until the first commits; its following
+    ``SELECT ... FOR UPDATE`` then sees and locks the committed row.
+
+    Only needed (and only done) on backends with row locking; SQLite
+    serialises writers itself.
+    """
+    if not rows or not _can_lock():
+        return
+    # A stable key order keeps concurrent writers from deadlocking on the
+    # unique index.
+    rows.sort(key=lambda row: tuple(getattr(row, f) for f in sort_fields))
+    model.objects.bulk_create(rows, ignore_conflicts=True)
+
+
+def _is_placeholder(row: Any, payload: Any) -> bool:
+    return row.admin_create_date == _PLACEHOLDER_DATE and not any(
+        value is not None for value in payload
+    )
 
 
 def _upsert_sleep(
@@ -271,14 +315,33 @@ def _upsert_sleep(
     admin_create_date: datetime,
     replay: bool = False,
 ) -> None:
+    _ensure_rows(
+        SleepDay,
+        [
+            SleepDay(
+                customer_id=customer_pk,
+                source=source,
+                device=device,
+                day=day,
+                intervals=[],
+                admin_create_date=_PLACEHOLDER_DATE,
+            )
+            for device, day in groups
+        ],
+        ["device", "day"],
+    )
     queryset = _lock_if_supported(
         SleepDay.objects.filter(
             customer_id=customer_pk,
             device__in={key[0] for key in groups},
             day__in={key[1] for key in groups},
-        )
+        ).order_by("device", "day")
     )
-    existing = {(row.device, row.day): row for row in queryset}
+    existing = {
+        (row.device, row.day): row
+        for row in queryset
+        if not _is_placeholder(row, row.intervals)
+    }
 
     rows = []
     for (device, day), pieces in groups.items():
@@ -292,8 +355,17 @@ def _upsert_sleep(
                 # Never move a day backwards: a newer upload (e.g. written
                 # live while this replay was running) already owns it.
                 continue
-            # Same timestamp: the replay group *is* the whole logical upload,
-            # so replace rather than merge (keeps re-runs idempotent).
+            if (
+                stored.admin_create_date == admin_create_date
+                and stored.source != source
+            ):
+                # Same timestamp from another pipeline: the key has no
+                # source, and live ingest merges same-timestamp writes, so
+                # union.  Re-runs stay idempotent (a union is stable).
+                entries |= {tuple(entry) for entry in stored.intervals}
+            # Same timestamp and source: the replay group *is* the whole
+            # logical upload, so replace rather than merge (keeps re-runs
+            # idempotent).
         elif stored is not None and stored.admin_create_date == admin_create_date:
             # Same upload timestamp split across calls: one logical upload —
             # merge, mirroring the legacy per-window "all records at the
@@ -325,6 +397,23 @@ def _merge_activity(
     admin_create_date: datetime,
     replay: bool = False,
 ) -> None:
+    _ensure_rows(
+        ActivityDay,
+        [
+            ActivityDay(
+                customer_id=customer_pk,
+                source=source,
+                device=device,
+                metric=metric,
+                day=day,
+                resolution_minutes=resolution,
+                values=[None] * (MINUTES_PER_DAY // resolution),
+                admin_create_date=_PLACEHOLDER_DATE,
+            )
+            for device, metric, resolution, day in groups
+        ],
+        ["device", "metric", "day", "resolution_minutes"],
+    )
     queryset = _lock_if_supported(
         ActivityDay.objects.filter(
             customer_id=customer_pk,
@@ -333,11 +422,12 @@ def _merge_activity(
             metric__in={key[1] for key in groups},
             resolution_minutes__in={key[2] for key in groups},
             day__in={key[3] for key in groups},
-        )
+        ).order_by("device", "metric", "day", "resolution_minutes")
     )
     existing = {
         (row.device, row.metric, row.resolution_minutes, row.day): row
         for row in queryset
+        if not _is_placeholder(row, row.values)
     }
 
     rows = []
@@ -417,8 +507,13 @@ def apply_compact(
     ``Record`` model instances (backfill) — anything with the record-shaped
     attributes.
 
-    The write runs in its own ``transaction.atomic()`` block, so outside an
+    The write runs in its own ``transaction.atomic()`` block (on the
+    database the router picks for the compact tables), so outside an
     enclosing transaction each call (= one upload) commits on its own.
+    Every affected key is row-locked for the duration (see
+    :func:`_ensure_rows`), so concurrent uploads for one customer, and a
+    backfill running alongside live ingest, serialise per key instead of
+    overwriting each other.
 
     ``replay=True`` is used by the backfill (:mod:`healthdatamodel.compat`),
     where *records* is the **complete** logical upload (every ``Record`` row
@@ -429,7 +524,9 @@ def apply_compact(
       **overwrite** slots (activity) instead of merging/summing — live
       ingest merges because one upload may arrive in several calls, but a
       replay group already contains all of them, so merging would
-      double-count on every re-run;
+      double-count on every re-run.  (Exception: a sleep day stored at the
+      same timestamp by a *different* ``source`` is unioned, as live ingest
+      would, since the sleep key has no source column);
     * stored row is **newer** than the replayed upload → sleep keeps the
       stored day; activity only fills slots that are still ``None``.
     """
@@ -437,7 +534,7 @@ def apply_compact(
     if not sleep and not activity:
         return leftovers
     customer_pk = _customer_pk(customer)
-    with transaction.atomic():
+    with transaction.atomic(using=_write_db()):
         if sleep:
             _upsert_sleep(customer_pk, source, sleep, admin_create_date, replay)
         if activity:

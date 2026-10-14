@@ -197,3 +197,37 @@ def test_unknown_customer_rejected():
 
 def test_no_data_passes():
     assert "PASS: no customers with Record data" in _verify()
+
+
+def test_sleep_compared_exactly(customer):
+    # A 6-minute (0.1 h) difference is real: compact sleep is stored at full
+    # precision, so --tolerance must not hide it.
+    _upload(customer)
+    row = SleepDay.objects.get()
+    end = datetime.combine(TODAY, time(6, 54)).replace(tzinfo=timezone.utc)
+    row.intervals = [[row.intervals[0][0], end.isoformat(), row.intervals[0][2]]]
+    row.save()
+    out = _verify_fails("--tolerance", "1.0")
+    assert f"MISMATCH sleep customer={customer.pk} {TODAY}" in out
+
+
+@needs_postgres
+def test_fractional_steps_within_rounding(customer):
+    # Steps are stored as whole numbers; a fractional legacy value differs by
+    # up to 0.5, which the default tolerance (0.2) must not flag for steps.
+    slot = RecordInput(
+        startDate=MIDNIGHT,
+        endDate=MIDNIGHT + timedelta(minutes=15),
+        creationDate=NOW,
+        sourceName="apple",
+        value="10.4",
+        unit="count",
+        type=ActivityMetric.STEPS.value,
+    )
+    ingest_records(
+        customer, [slot], source=DataSource.APPLE_HEALTH, admin_create_date=NOW
+    )
+    assert ActivityDay.objects.get(metric="steps").values[0] == 10
+    out = _verify()
+    assert "PASS:" in out
+    assert _row(out, "STEPS@15min") == ["3", "1", "0"]
