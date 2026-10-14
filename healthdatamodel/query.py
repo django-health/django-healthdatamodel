@@ -27,6 +27,18 @@ sleep interval, capped at the day boundary, not rounded).
 PostgreSQL (window-function CTEs for source-ranked deduplication).
 Sleep functions work with any Django-supported backend.
 
+Record-level readers
+--------------------
+- :func:`get_sleep_records`        — raw sleep records in a window
+- :func:`infer_resolution_minutes` — interval length of the newest activity
+  record in a window
+- :func:`iter_records` / :func:`iter_workouts` — a customer's records /
+  workouts, newest first (exports)
+
+These return :class:`~healthdatamodel.schemas.StoredRecord` /
+:class:`~healthdatamodel.schemas.StoredWorkout` value objects rather than
+model instances, so they keep working once storage is compacted (v1.0).
+
 Ranking / source utilities
 --------------------------
 - :func:`ensure_ranks` — ensure one
@@ -41,8 +53,9 @@ from __future__ import annotations
 
 import sys
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 if sys.version_info >= (3, 11):
     from enum import StrEnum
@@ -59,7 +72,13 @@ from django.db.models.expressions import Func
 from django.db.models.functions import Cast, Rank, Replace
 
 from healthdatamodel.constants import ConnectionStatus, DataSource
-from healthdatamodel.models import DataSourceRanking, Record, WearableConnection
+from healthdatamodel.models import (
+    DataSourceRanking,
+    Record,
+    WearableConnection,
+    Workout,
+)
+from healthdatamodel.schemas import StoredRecord, StoredWorkout
 
 _DEFAULT_SLEEP_DEVICE_SORT_ORDER = ["oura", "whoop", "apple", "garmin"]
 
@@ -602,3 +621,205 @@ def get_activity_by_day_from_records(
 
     days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
     return {day: raw.get(day) for day in days}
+
+
+# ---------------------------------------------------------------------------
+# Public API — record-level readers
+# ---------------------------------------------------------------------------
+
+_RECORD_FIELDS = (
+    "customer_id",
+    "startDate",
+    "endDate",
+    "creationDate",
+    "sourceName",
+    "source",
+    "value",
+    "type",
+    "admin_create_date",
+    "unit",
+    "sourceVersion",
+    "device",
+)
+
+_WORKOUT_FIELDS = (
+    "customer_id",
+    "startDate",
+    "endDate",
+    "creationDate",
+    "sourceName",
+    "source",
+    "durationUnit",
+    "duration",
+    "workoutActivityType",
+    "admin_create_date",
+    "sourceVersion",
+    "device",
+)
+
+
+def _stored_records(rows: Iterable[tuple[Any, ...]]) -> Iterator[StoredRecord]:
+    for row in rows:
+        yield StoredRecord(*row)
+
+
+def get_sleep_records(
+    customer: Any,
+    start: datetime,
+    end: datetime,
+    *,
+    asleep_only: bool = False,
+) -> list[StoredRecord]:
+    """Return the customer's raw sleep records with ``start <= startDate <= end``.
+
+    Both bounds are **inclusive** and apply to ``startDate`` only (the query
+    rides the ``(customer, type, startDate)`` index); filter on ``endDate`` in
+    the caller if sessions must also end inside the window.  Records from
+    every source and every upload are returned — no device preference or
+    de-duplication is applied (use :func:`get_sleep_by_day` for that).
+
+    Parameters
+    ----------
+    customer:
+        Any ``settings.AUTH_USER_MODEL`` instance.
+    start, end:
+        Inclusive ``startDate`` window (aware datetimes).
+    asleep_only:
+        If ``True``, only ``HKCategoryValueSleepAnalysisAsleep*`` values are
+        returned (``Awake`` / ``InBed`` dropped).  Default ``False`` returns
+        every sleep-analysis value.
+
+    Returns
+    -------
+    list[StoredRecord]
+        Ordered by ``startDate`` then ``endDate``.
+    """
+    qs = Record.objects.filter(
+        customer=customer,
+        type=SLEEP_TYPE,
+        startDate__gte=start,
+        startDate__lte=end,
+    )
+    if asleep_only:
+        qs = qs.filter(value__startswith=_SLEEP_VALUE_PREFIX)
+    return list(
+        _stored_records(
+            qs.order_by("startDate", "endDate", "pk").values_list(*_RECORD_FIELDS)
+        )
+    )
+
+
+_DEFAULT_RESOLUTION_TYPES: tuple[str, ...] = (
+    ActivityMetric.STEPS.value,
+    ActivityMetric.ACTIVE_CALORIES.value,
+)
+
+
+def infer_resolution_minutes(
+    customer: Any,
+    start: datetime,
+    end: datetime,
+    *,
+    source: str | None = None,
+    types: Iterable[str] = _DEFAULT_RESOLUTION_TYPES,
+) -> int | None:
+    """Infer the interval length (minutes) of the customer's newest activity data.
+
+    Looks at records with ``startDate >= start`` and ``endDate <= end`` whose
+    ``type`` is in *types* (default: step count and active energy), picks the
+    one uploaded most recently (``admin_create_date``; ties broken by
+    insertion order), and returns ``endDate - startDate`` in whole minutes,
+    truncated.  Typical results are ``15`` (intraday) and ``1440`` (daily).
+
+    Parameters
+    ----------
+    customer:
+        Any ``settings.AUTH_USER_MODEL`` instance.
+    start, end:
+        Window the record must lie entirely within (aware datetimes).
+    source:
+        If given, only records from this data pipeline (``Record.source``,
+        e.g. ``DataSource.FITBIT``) are considered.
+    types:
+        HK type strings to consider.  Defaults to
+        ``(ActivityMetric.STEPS, ActivityMetric.ACTIVE_CALORIES)``.
+
+    Returns
+    -------
+    int | None
+        Minutes, or ``None`` when no matching record exists.
+    """
+    qs = Record.objects.filter(
+        customer=customer,
+        startDate__gte=start,
+        endDate__lte=end,
+        type__in=[str(t) for t in types],
+    )
+    if source is not None:
+        qs = qs.filter(source=source)
+    newest = (
+        qs.order_by("-admin_create_date", "-pk").values_list("startDate", "endDate")
+    ).first()
+    if newest is None:
+        return None
+    first, last = newest
+    return int((last - first).total_seconds() // 60)
+
+
+def iter_records(
+    customer: Any,
+    *,
+    limit: int | None = None,
+    order: Literal["-startDate", "startDate"] = "-startDate",
+    chunk_size: int = 2000,
+) -> Iterator[StoredRecord]:
+    """Iterate over all of a customer's records (e.g. for a data export).
+
+    Parameters
+    ----------
+    customer:
+        Any ``settings.AUTH_USER_MODEL`` instance.
+    limit:
+        Maximum number of records to yield (``None`` → all).
+    order:
+        ``"-startDate"`` (newest first, default) or ``"startDate"``.
+    chunk_size:
+        Rows fetched per database round trip.
+    """
+    if order not in ("-startDate", "startDate"):
+        raise ValueError(f"unsupported order {order!r}")
+    pk_order = "-pk" if order.startswith("-") else "pk"
+    qs = (
+        Record.objects.filter(customer=customer)
+        .order_by(order, pk_order)
+        .values_list(*_RECORD_FIELDS)
+    )
+    if limit is not None:
+        qs = qs[:limit]
+    yield from _stored_records(qs.iterator(chunk_size=chunk_size))
+
+
+def iter_workouts(
+    customer: Any,
+    *,
+    limit: int | None = None,
+    order: Literal["-startDate", "startDate"] = "-startDate",
+    chunk_size: int = 2000,
+) -> Iterator[StoredWorkout]:
+    """Iterate over all of a customer's workouts (e.g. for a data export).
+
+    Same parameters as :func:`iter_records`.  Workout metadata entries are
+    not included.
+    """
+    if order not in ("-startDate", "startDate"):
+        raise ValueError(f"unsupported order {order!r}")
+    pk_order = "-pk" if order.startswith("-") else "pk"
+    qs = (
+        Workout.objects.filter(customer=customer)
+        .order_by(order, pk_order)
+        .values_list(*_WORKOUT_FIELDS)
+    )
+    if limit is not None:
+        qs = qs[:limit]
+    for row in qs.iterator(chunk_size=chunk_size):
+        yield StoredWorkout(*row)

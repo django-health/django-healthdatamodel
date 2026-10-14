@@ -242,6 +242,144 @@ totals = get_activity_by_day_from_records(records, metric, start_date, end_date)
 # dict[date, float | None] — no database query
 ```
 
+## Consumer helpers
+
+**These functions are the supported entry points for everything a host
+project does with a customer's health data.** Direct ORM access to `Record`,
+`Workout` or `WorkoutMetadataEntry` (`customer.record_set...`,
+`Record.objects.filter(...).update(...)`, `Record(...)` +
+`bulk_create`, raw SQL over `healthdatamodel_record`) is **unsupported from
+v1.0 onward**: v1.0 adds compact storage tables that must be kept in sync
+with `Record`, and only these helpers (plus the query and ingest APIs above)
+will do that. In v0.11 they are thin wrappers over the existing tables, so
+switching to them now is behaviour-preserving and makes the v1.0 upgrade a
+version bump.
+
+| Need | Helper |
+| --- | --- |
+| Save records / workouts | `ingest.ingest_records`, `ingest.ingest_workouts` |
+| Restore archived rows verbatim | `ingest.restore_records` |
+| Does the customer have any data? | `customer_data.has_records` |
+| Fitness / onboarding reset | `customer_data.delete_records` |
+| Delete everything (data rights) | `customer_data.delete_customer_health_data` |
+| Account merge | `customer_data.reassign_customer_health_data` |
+| Per-source sync dates + rank | `customer_data.get_data_source_summary` |
+| Resolution of the newest activity data | `query.infer_resolution_minutes` |
+| Raw sleep records in a window | `query.get_sleep_records` |
+| Export a customer's rows | `query.iter_records`, `query.iter_workouts` |
+| Test fixtures | `testing.create_records`, `testing.create_record`, `testing.record_input` |
+
+### Customer lifecycle (`healthdatamodel.customer_data`)
+
+```python
+from healthdatamodel.customer_data import (
+    has_records,
+    delete_records,
+    delete_customer_health_data,
+    reassign_customer_health_data,
+    get_data_source_summary,
+)
+
+has_records(customer)  # -> bool
+
+delete_records(customer)  # -> int; records only (workouts/rankings kept)
+
+delete_customer_health_data(customer)  # one transaction
+# -> {"records": 120, "workouts": 3, "workout_metadata": 9, "rankings": 8}
+delete_customer_health_data(
+    customer, rankings=False
+)  # flags: records/workouts/rankings
+
+# Account merge: re-point rows (no copy, no de-duplication).
+if not has_records(current) and has_records(existing):
+    reassign_customer_health_data(existing, current)  # -> {"records": n, "workouts": n}
+```
+
+`delete_customer_health_data` never touches `WearableConnection`.
+`reassign_customer_health_data` moves records and workouts (metadata follows
+its workout) but not `DataSourceRanking` (rebuilt by `ensure_ranks`) or
+`WearableConnection`; pass `workouts=False` to move records only.
+
+`get_data_source_summary(customer)` returns `dict[str, DataSourceSummary]`
+keyed by data source, covering every source that has records **or** a
+ranking row:
+
+```python
+summary = get_data_source_summary(customer)
+s = summary["apple_health"]
+s.last_sync_date  # MAX(admin_create_date): when data was last received
+s.connected_date  # MIN(admin_create_date): when data was first received
+s.most_recent_data_date  # MAX(endDate): freshness of the data itself
+s.rank  # DataSourceRanking.rank, or None
+s.has_data  # connected_date is not None
+```
+
+A ranked source with no records has all dates `None`; a source with records
+but no ranking row has `rank=None`; blank/`NULL` sources are omitted. Works
+on any backend.
+
+### Record-level readers (`healthdatamodel.query`)
+
+These return frozen `StoredRecord` / `StoredWorkout` dataclasses
+(`healthdatamodel.schemas`), not model instances. They have the familiar
+field names (`startDate`, `endDate`, `value`, `sourceName`, `source`,
+`type`, `unit`, `admin_create_date`, ...) plus `customer_id`, but **no
+primary key** — compact storage has none.
+
+```python
+from healthdatamodel.query import (
+    get_sleep_records,
+    infer_resolution_minutes,
+    iter_records,
+    iter_workouts,
+)
+
+# Every sleep-analysis record (all values, all sources, all uploads) with
+# start <= startDate <= end, ordered by startDate.
+rows = get_sleep_records(customer, start_dt, end_dt)
+rows = get_sleep_records(customer, start_dt, end_dt, asleep_only=True)
+
+# Interval length, in whole minutes, of the most recently uploaded
+# step/active-energy record lying inside [start, end]; None if there is none.
+infer_resolution_minutes(customer, wk_start, wk_end)  # e.g. 15 or 1440
+infer_resolution_minutes(customer, wk_start, wk_end, source=DataSource.FITBIT)
+infer_resolution_minutes(customer, wk_start, wk_end, types=[ActivityMetric.STEPS])
+
+# Exports: newest first by default, streamed in chunks.
+for r in iter_records(customer, limit=10_000):
+    ...
+for w in iter_workouts(customer, limit=5_000, order="startDate"):
+    ...
+```
+
+### Restoring archived records (`healthdatamodel.ingest.restore_records`)
+
+`ingest_records` stamps one `source` and one `admin_create_date` on the
+whole batch. To put back rows exported from `healthdatamodel_record` (e.g.
+a parquet archive) use `restore_records`, which keeps each row's own
+customer, `source`, `creationDate` and `admin_create_date`:
+
+```python
+from healthdatamodel.ingest import restore_records
+
+n = restore_records(df.to_dict("records"), batch_size=1000)
+```
+
+It accepts `StoredRecord` objects or mappings (`customer_id` or `customer`,
+plus `startDate`, `endDate`, `creationDate`, `sourceName`, `source`, `value`,
+`type`, `admin_create_date`; optional `unit`, `sourceVersion`, `device`).
+An archived `id` is ignored, NaN in an optional column becomes `NULL`, and
+the iterable is consumed one batch at a time. Wrap the call in
+`transaction.atomic()` if you need all-or-nothing.
+
+### Ingest notes
+
+`ingest_records` / `ingest_workouts` now return the number of rows saved.
+`ingest_workouts` runs in one transaction and bulk-inserts where the backend
+returns primary keys. `RecordInput.value` accepts plain numbers (e.g. Fitbit
+API values) and stringifies them; negative values are stored as `"0.0"`, as
+negative strings already were.
+
 ## Admin
 
 Admin classes (`WorkoutAdmin`, `RecordAdmin`, `WearableConnectionAdmin`, etc.) are defined in `healthdatamodel.admin` but **not registered** — registration is left to the host project:
@@ -265,6 +403,42 @@ class WearableConnectionAdmin(Base):
 from healthdatamodel.testing import set_customer_device
 
 set_customer_device(customer, data_source="apple_health", device_brand="apple")
+```
+
+Create fixture records **through the ingest path** so they stay visible to
+the query API once compact storage lands in v1.0 (records made with
+`Record.objects.create` will not be):
+
+```python
+from healthdatamodel.testing import create_record, create_records, record_input
+
+# Drop-in for Record.objects.create(...): same keyword fields, sensible defaults
+# (15-min step-count interval, value "0", sourceName "test", creationDate now).
+create_record(
+    customer=customer,
+    startDate=start,
+    endDate=end,
+    type=SLEEP_TYPE,
+    value=SleepValue.ASLEEP_UNSPECIFIED,
+    source=DataSource.APPLE_HEALTH,  # default apple_health
+    admin_create_date=ts,  # default now
+)
+
+# Many at once: RecordInput objects or dicts of RecordInput fields; dicts may
+# carry their own "source" / "admin_create_date".
+create_records(
+    customer,
+    [
+        {"startDate": t, "value": 20, "type": ActivityMetric.ACTIVE_CALORIES}
+        for t in times
+    ],
+    source=DataSource.FITBIT,
+    admin_create_date=ts,
+)
+
+record_input(
+    startDate=t, value=5
+)  # just build a RecordInput (endDate = start + 15 min)
 ```
 
 ## Demo project
