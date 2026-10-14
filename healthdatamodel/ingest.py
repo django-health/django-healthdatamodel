@@ -28,7 +28,8 @@ Entry points
 
 ``restore_records``
     Re-insert previously archived records verbatim, preserving each row's
-    own ``source``, ``creationDate`` and ``admin_create_date``.
+    own ``source``, ``creationDate`` and ``admin_create_date`` (and, from
+    1.0, replay them into the compact tables).
 
 Compact storage (v1.0)
 ----------------------
@@ -49,15 +50,17 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta, timezone
 from itertools import islice
-from typing import Any
+from typing import Any, NamedTuple
 
 from asgiref.sync import sync_to_async
 from django.db import connections, router, transaction
 
 from healthdatamodel import compact
+from healthdatamodel.compat import COMPACTABLE_TYPES
 from healthdatamodel.models import Record, Workout, WorkoutMetadataEntry
 from healthdatamodel.query import ActivityMetric
 from healthdatamodel.schemas import RecordInput, StoredRecord, WorkoutInput
@@ -438,6 +441,33 @@ def _restored_to_django(row: StoredRecord | Mapping[str, Any]) -> Record:
     return Record(customer_id=customer_id, **fields)
 
 
+class _RestoredRow(NamedTuple):
+    """The record-shaped fields the compact router needs, kept per restored
+    row until the input is exhausted (lighter than a model instance)."""
+
+    startDate: datetime
+    endDate: datetime
+    sourceName: str
+    value: str
+    unit: str | None
+    type: str
+
+
+def _as_datetime(field: str, value: Any) -> datetime:
+    return Record._meta.get_field(field).to_python(value)
+
+
+def _route_restored(
+    uploads: dict[tuple[Any, datetime, str], list[_RestoredRow]],
+) -> None:
+    """Replay buffered restored uploads into the compact tables, oldest first."""
+    for key in sorted(uploads, key=lambda k: (k[0], k[1], k[2])):
+        customer_id, admin_create_date, source = key
+        compact.apply_compact(
+            customer_id, uploads[key], source, admin_create_date, replay=True
+        )
+
+
 def restore_records(
     records: Iterable[StoredRecord | Mapping[str, Any]],
     batch_size: int = 1000,
@@ -448,8 +478,28 @@ def restore_records(
     ``source``, ``creationDate`` and ``admin_create_date`` — use this when
     restoring rows from an archive (e.g. parquet exported from
     ``healthdatamodel_record``) so that upload-time ordering, which the sleep
-    and activity queries rely on, is preserved.  From v1.0 this also writes
-    the compact storage tables.
+    and activity queries rely on, is preserved.
+
+    Compact storage (1.0)
+        Unless ``HEALTHDATAMODEL_SAVE_COMPACT`` is ``False``, the restored
+        sleep and activity rows are also written to ``SleepDay`` /
+        ``ActivityDay`` through the backfill's replay path
+        (:func:`healthdatamodel.compat.replay_records` semantics): rows are
+        grouped into uploads by ``(customer, admin_create_date, source)``
+        and replayed oldest first, so a restored upload **older** than
+        what is stored never overwrites newer data (activity only fills empty
+        slots), and one with the **same** ``admin_create_date`` as a stored
+        row replaces that upload's earlier write instead of adding to it.
+        The compact tables therefore end up the same however often a
+        restore is repeated.  ``Record`` does not: it has no unique key, so
+        restoring the same rows twice stores them twice (and the legacy
+        read path would count activity twice).
+        An upload must be passed whole within one call, and its compactable
+        rows are held in memory until the input is exhausted; for a large
+        archive call this once per customer or per batch of customers.
+
+    The whole call runs in one transaction: either every row is restored
+    (to ``Record`` and the compact tables) or none is.
 
     Parameters
     ----------
@@ -470,22 +520,45 @@ def restore_records(
     Returns
     -------
     int
-        Number of records inserted.
+        Number of records inserted into ``Record``.
 
     Raises
     ------
     ValueError
-        If a mapping lacks a required field.  Batches already written are
-        not rolled back; wrap the call in ``transaction.atomic()`` for
-        all-or-nothing behaviour.
+        If a mapping lacks a required field.  Nothing is written in that
+        case (the transaction is rolled back).
     """
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1")
+    route = compact.save_compact_enabled()
+    uploads: dict[tuple[Any, datetime, str], list[_RestoredRow]] = defaultdict(list)
     inserted = 0
     rows = iter(records)
-    while batch := [_restored_to_django(r) for r in islice(rows, batch_size)]:
-        Record.objects.bulk_create(batch, batch_size=batch_size)
-        inserted += len(batch)
+    with transaction.atomic(using=router.db_for_write(Record)):
+        while batch := [_restored_to_django(r) for r in islice(rows, batch_size)]:
+            Record.objects.bulk_create(batch, batch_size=batch_size)
+            inserted += len(batch)
+            if not route:
+                continue
+            for rec in batch:
+                if rec.type not in COMPACTABLE_TYPES:
+                    continue
+                key = (
+                    rec.customer_id,
+                    _as_datetime("admin_create_date", rec.admin_create_date),
+                    rec.source,
+                )
+                uploads[key].append(
+                    _RestoredRow(
+                        _as_datetime("startDate", rec.startDate),
+                        _as_datetime("endDate", rec.endDate),
+                        rec.sourceName,
+                        rec.value,
+                        rec.unit,
+                        rec.type,
+                    )
+                )
+        _route_restored(uploads)
     return inserted
 
 

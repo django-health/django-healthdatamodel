@@ -25,7 +25,8 @@ sleep interval, capped at the day boundary, not rounded).
 
 Read paths
 ----------
-Every public function dispatches on ``settings.HEALTHDATAMODEL_READ_COMPACT``:
+The sleep and activity functions above and :func:`has_competing_sources`
+dispatch on ``settings.HEALTHDATAMODEL_READ_COMPACT``:
 
 * ``False`` (**the default**) — the legacy path over ``Record``.
   :func:`get_activity_records` / :func:`get_activity_by_day` then require
@@ -47,7 +48,10 @@ Record-level readers
 
 These return :class:`~healthdatamodel.schemas.StoredRecord` /
 :class:`~healthdatamodel.schemas.StoredWorkout` value objects rather than
-model instances, so they keep working once storage is compacted (v1.0).
+model instances.  In 1.0 they **always read ``Record`` / ``Workout``**,
+whatever ``HEALTHDATAMODEL_READ_COMPACT`` says, so they require
+``HEALTHDATAMODEL_SAVE_RECORDS = True`` (the 1.0.x invariant) and only see
+what your ``Record`` retention keeps.
 
 Ranking / source utilities
 --------------------------
@@ -908,6 +912,9 @@ def get_sleep_records(
     every source and every upload are returned — no device preference or
     de-duplication is applied (use :func:`get_sleep_by_day` for that).
 
+    Reads ``Record`` in every read mode, so it requires
+    ``HEALTHDATAMODEL_SAVE_RECORDS = True`` (the 1.0.x invariant).
+
     Parameters
     ----------
     customer:
@@ -961,6 +968,9 @@ def infer_resolution_minutes(
     insertion order), and returns ``endDate - startDate`` in whole minutes,
     truncated.  Typical results are ``15`` (intraday) and ``1440`` (daily).
 
+    Reads ``Record`` in every read mode, so it requires
+    ``HEALTHDATAMODEL_SAVE_RECORDS = True`` (the 1.0.x invariant).
+
     Parameters
     ----------
     customer:
@@ -1004,6 +1014,9 @@ def iter_records(
     chunk_size: int = 2000,
 ) -> Iterator[StoredRecord]:
     """Iterate over all of a customer's records (e.g. for a data export).
+
+    Reads ``Record`` in every read mode, so it requires
+    ``HEALTHDATAMODEL_SAVE_RECORDS = True`` (the 1.0.x invariant).
 
     Parameters
     ----------
