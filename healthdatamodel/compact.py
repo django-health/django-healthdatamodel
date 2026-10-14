@@ -269,6 +269,7 @@ def _upsert_sleep(
     source: str,
     groups: _SleepGroups,
     admin_create_date: datetime,
+    replay: bool = False,
 ) -> None:
     queryset = _lock_if_supported(
         SleepDay.objects.filter(
@@ -286,7 +287,14 @@ def _upsert_sleep(
             for piece_start, piece_end, stage in pieces
         }
         stored = existing.get((device, day))
-        if stored is not None and stored.admin_create_date == admin_create_date:
+        if replay and stored is not None:
+            if stored.admin_create_date > admin_create_date:
+                # Never move a day backwards: a newer upload (e.g. written
+                # live while this replay was running) already owns it.
+                continue
+            # Same timestamp: the replay group *is* the whole logical upload,
+            # so replace rather than merge (keeps re-runs idempotent).
+        elif stored is not None and stored.admin_create_date == admin_create_date:
             # Same upload timestamp split across calls: one logical upload —
             # merge, mirroring the legacy per-window "all records at the
             # winning admin_create_date are counted".
@@ -315,6 +323,7 @@ def _merge_activity(
     source: str,
     groups: _ActivityGroups,
     admin_create_date: datetime,
+    replay: bool = False,
 ) -> None:
     queryset = _lock_if_supported(
         ActivityDay.objects.filter(
@@ -338,17 +347,32 @@ def _merge_activity(
         same_upload = (
             stored is not None and stored.admin_create_date == admin_create_date
         )
+        # Replaying an upload older than the stored row (a live write landed
+        # first, or an archive load): only fill slots nobody has written.
+        older_replay = (
+            replay
+            and stored is not None
+            and stored.admin_create_date > admin_create_date
+        )
         values: list[float | int | None]
         if stored is not None and len(stored.values) == length:
             values = list(stored.values)
         else:
             values = [None] * length
+        changed = False
         for index, value in slots.items():
-            if same_upload and values[index] is not None:
+            if older_replay and values[index] is not None:
+                continue
+            if same_upload and not replay and values[index] is not None:
                 # Same upload timestamp split across calls: legacy returns
-                # both tied rows, which day-level aggregation sums.
+                # both tied rows, which day-level aggregation sums.  (A
+                # replay group already holds the whole logical upload, so
+                # replay overwrites instead — re-runs stay idempotent.)
                 value = values[index] + value
             values[index] = value if isinstance(value, int) else round(value, 1)
+            changed = True
+        if older_replay and not changed:
+            continue
         rows.append(
             ActivityDay(
                 customer_id=customer_pk,
@@ -358,7 +382,9 @@ def _merge_activity(
                 day=day,
                 resolution_minutes=resolution,
                 values=values,
-                admin_create_date=admin_create_date,
+                admin_create_date=(
+                    stored.admin_create_date if older_replay else admin_create_date
+                ),
             )
         )
     ActivityDay.objects.bulk_create(
@@ -381,6 +407,8 @@ def apply_compact(
     records: Iterable[Any],
     source: str,
     admin_create_date: datetime,
+    *,
+    replay: bool = False,
 ) -> list[Any]:
     """Write *records* to the compact tables; return uncompactable leftovers.
 
@@ -388,6 +416,22 @@ def apply_compact(
     passes pks).  *records* may be ``RecordInput`` objects (live ingest) or
     ``Record`` model instances (backfill) — anything with the record-shaped
     attributes.
+
+    The write runs in its own ``transaction.atomic()`` block, so outside an
+    enclosing transaction each call (= one upload) commits on its own.
+
+    ``replay=True`` is used by the backfill (:mod:`healthdatamodel.compat`),
+    where *records* is the **complete** logical upload (every ``Record`` row
+    sharing ``(customer, admin_create_date, source)``).  Two rules change so
+    that replaying is idempotent and never regresses newer data:
+
+    * same ``admin_create_date`` as the stored row → **replace** (sleep) /
+      **overwrite** slots (activity) instead of merging/summing — live
+      ingest merges because one upload may arrive in several calls, but a
+      replay group already contains all of them, so merging would
+      double-count on every re-run;
+    * stored row is **newer** than the replayed upload → sleep keeps the
+      stored day; activity only fills slots that are still ``None``.
     """
     sleep, activity, leftovers = route_records(records)
     if not sleep and not activity:
@@ -395,7 +439,7 @@ def apply_compact(
     customer_pk = _customer_pk(customer)
     with transaction.atomic():
         if sleep:
-            _upsert_sleep(customer_pk, source, sleep, admin_create_date)
+            _upsert_sleep(customer_pk, source, sleep, admin_create_date, replay)
         if activity:
-            _merge_activity(customer_pk, source, activity, admin_create_date)
+            _merge_activity(customer_pk, source, activity, admin_create_date, replay)
     return leftovers
