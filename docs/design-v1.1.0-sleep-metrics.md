@@ -58,10 +58,50 @@ the summary can never describe a different night or device than the hours
 figure. `get_sleep_by_day` output is unchanged (it still counts only the
 asleep subset, deduplicated by `(start, end)`, without merging overlaps).
 
-Small parity fix shipped alongside: the compact router maps any unmapped
-value starting with `HKCategoryValueSleepAnalysisAsleep` to `unspecified`
-(`sleep_stage_for_value`), because the legacy read path counts such values
-as asleep by prefix.
+`get_sleep_intervals_by_day` clips to the window and then merges intervals
+of the **same stage** that overlap or touch. The compact tables store a
+record that crosses the canonical 14:00 UTC boundary as two pieces, so with
+any other `day_boundary_hour` the unmerged list would hold one interval in
+legacy mode and two in compact mode; the per-stage union is identical in
+both. (Different stages may still overlap, e.g. `in_bed` around `core`.)
+The summary and SRI take unions anyway, so they are unaffected.
+
+In legacy mode the candidate device names are sorted before ranking, as the
+compact path already did, so devices that tie in `_rank_sleep_devices`
+(names differing only in case) resolve the same way in both modes instead
+of depending on database row order.
+
+### Read-mode parity fixes shipped alongside
+
+- `constants.sleep_stage_for_value` maps any uncatalogued value starting
+  with `HKCategoryValueSleepAnalysisAsleep` to `unspecified`, because the
+  legacy read path counts such values as asleep by prefix. It is used by
+  `compact.route_records`, so it applies to every compact write: live dual
+  writes (`ingest_records`), the backfill and `replay_records`,
+  `restore_records` and `reassign_customer_health_data`. Rows written by
+  1.0.0 are not rewritten; re-run `backfill_compact` (idempotent) for
+  customers who sent such values to pick them up from what `Record` still
+  holds.
+- `compat.backfill_coverage` (used by `compact_status`) counts those values
+  as compactable sleep too. Before, a customer whose only sleep history used
+  such a value looked as if they had no compactable sleep, so
+  `compact_status` could report READY while `SleepDay` lacked it.
+- `verify_compact` gains a `sleep_stages` check that compares
+  `get_sleep_intervals_by_day` exactly in both modes. The existing `sleep`
+  check only looks at asleep hours and wake time; the new functions also
+  read awake and in-bed intervals.
+
+## Time zones and the sleep-day boundary
+
+The sleep-day window is `day_boundary_hour` (default 14) to
+`day_boundary_hour` in the stored timestamps' clock, i.e. "UTC". The main
+consumer stores every datetime as the member's **local wall-clock time
+labelled UTC** (an intentional convention), so for it the boundary is really
+2 pm local, `sleep_start` / `sleep_end` come back as local times with a UTC
+label, and it should leave `tz=None`. The `tz` parameter of the summary
+functions is for consumers that store true UTC: it converts `sleep_start` /
+`sleep_end` for presentation only and does not move the windows. Nothing in
+1.1 changes behaviour for either convention.
 
 ## Definitions
 
@@ -128,9 +168,16 @@ did not wear the device for a night would otherwise look maximally irregular.
   `get_sleep_by_day`); intervals from other devices are ignored, not merged.
 - Minute resolution: SRI marks minute *t* asleep when its start lies in an
   asleep interval; sub-minute gaps are not awakenings.
-- The day windows are UTC-based (`day_boundary_hour`); `tz` only converts the
-  reported `sleep_start` / `sleep_end`. For members far from UTC, a main sleep
-  can straddle the 2 pm UTC boundary and be split across two days.
+- The day windows follow the stored clock (`day_boundary_hour`); `tz` only
+  converts the reported `sleep_start` / `sleep_end`. For a consumer storing
+  true UTC, a main sleep of a member far from UTC can straddle the 2 pm UTC
+  boundary and be split across two days. (Not an issue under the
+  local-time-labelled-UTC convention, where the boundary is 2 pm local.)
+- DST: windows are fixed 24-hour spans of the stored clock. With true UTC the
+  SRI compares instants exactly 24 h apart and `tz` renders each end with
+  its own offset. Under the local-time-labelled-UTC convention a DST night is
+  measured in wall-clock time (e.g. 23:00–07:00 counts as 8 h on the night
+  the clocks spring forward).
 - SRI over four nights is a noisy, short-window measure; the SRI literature
   usually uses a week or more. `days` is configurable.
 - `asleep_minutes + nap_minutes` can differ slightly from

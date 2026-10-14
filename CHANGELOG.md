@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - Unreleased
+
+Per-night sleep summary and Sleep Regularity Index. Additive: no schema
+change, no migration, no settings change (`HEALTHDATAMODEL_SAVE_RECORDS`
+stays `True` by default; the 1.0.x upgrade guidance applies unchanged).
+Design: [`docs/design-v1.1.0-sleep-metrics.md`](docs/design-v1.1.0-sleep-metrics.md).
+
+### Added
+
+- `healthdatamodel.query.get_sleep_intervals_by_day(customer, start, end,
+  day_boundary_hour=14)` — every stage interval (asleep stages, `awake`,
+  `in_bed`) of each night's chosen upload and device, as `SleepInterval`
+  named tuples clipped to the night window; same-stage intervals that
+  overlap or touch are merged. The upload/device choice is the same internal
+  routine `get_sleep_by_day` uses, so both always describe the same night.
+- `get_sleep_summary_by_day(customer, start, end, day_boundary_hour=14,
+  tz=None, main_sleep_gap_minutes=120)` — `DailySleepSummary` per day:
+  main-sleep `sleep_start` / `sleep_end`, `asleep_minutes`,
+  `in_bed_minutes` (from `in_bed` data, else inferred), `awake_minutes`,
+  `efficiency`, `awakenings`, `nap_minutes`, `device`, `has_in_bed_data`.
+  `tz` only converts `sleep_start` / `sleep_end` for display; installs that
+  store local wall-clock time labelled UTC should leave it unset.
+- `get_sleep_regularity_index(customer, end_day, days=4,
+  day_boundary_hour=14)` — Sleep Regularity Index (Phillips et al. 2017,
+  `−100 + 200 × matches / pairs` over minutes 24 h apart) and
+  `consistency_pct`; nights without data are excluded, not counted as awake.
+- `healthdatamodel.sleep`: the pure (no database) `summarize_sleep_intervals`
+  and `sleep_regularity_from_intervals`, plus `SleepInterval`,
+  `DailySleepSummary`, `SleepRegularity` (all re-exported by `query`).
+- `constants.sleep_stage_for_value` and `SLEEP_ASLEEP_VALUE_PREFIX`.
+- `verify_compact` compares `get_sleep_intervals_by_day` in both read modes
+  (new `sleep_stages` row; awake and in-bed intervals were not checked
+  before).
+
+### Fixed
+
+- Compact sleep: an uncatalogued value starting with
+  `HKCategoryValueSleepAnalysisAsleep` is stored as `unspecified` instead of
+  being left out of `SleepDay` (the legacy read path counts such values as
+  asleep). Applies to live dual writes, `backfill_compact` /
+  `replay_records`, `restore_records` and `reassign_customer_health_data`.
+  Rows written by 1.0.0 are not rewritten; re-run `backfill_compact` for
+  affected customers.
+- `backfill_coverage` / `compact_status` count those values as compactable
+  sleep, so a customer whose only sleep history used one is reported
+  pending until backfilled instead of looking fully covered.
+- Legacy sleep reads sort candidate device names before ranking (as the
+  compact path does), so devices that tie in the ranking (names differing
+  only in case) resolve the same way in both read modes and on every
+  database.
+
 ## [1.0.0] - 2026-10-14
 
 Compact storage. Sleep and activity are additionally stored in two

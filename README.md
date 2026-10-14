@@ -136,7 +136,8 @@ from healthdatamodel.query import (
     get_sleep_regularity_index,
 )
 
-# Every stage of the chosen device, clipped to the night window, sorted
+# Every stage of the chosen device, clipped to the night window, sorted;
+# overlapping or touching intervals of the same stage are merged
 get_sleep_intervals_by_day(customer, date(2025, 6, 1), date(2025, 6, 7))
 # {date: [SleepInterval(start, end, stage="core", device="Apple Watch"), ...], ...}
 # []  → no sleep records that night
@@ -155,6 +156,13 @@ get_sleep_regularity_index(customer, end_day=date(2025, 6, 7))  # last 4 nights
 # SleepRegularity(sri=81.3, consistency_pct=90.65, days_with_data=4,
 #                 minutes_compared=4320)
 ```
+
+**Time zones.** Sleep days run from `day_boundary_hour` to
+`day_boundary_hour` in the stored clock ("UTC"). If, like the main consumer,
+you store local wall-clock time labelled UTC, the default boundary is really
+2 pm local and `sleep_start` / `sleep_end` are already local: leave `tz`
+unset. `tz` is for installs that store true UTC; it only converts
+`sleep_start` / `sleep_end` for display and does not move the day windows.
 
 What each summary field means:
 
@@ -521,7 +529,7 @@ and verification.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `HEALTHDATAMODEL_SAVE_RECORDS` | `True` | Write every upload through to the legacy `Record` log. This is the rollback path, so keep it on throughout 1.0.x. `reassign_customer_health_data` and the `Record`-reading helpers (`has_records`, `get_data_source_summary`, `get_sleep_records`, `infer_resolution_minutes`, `iter_records`) depend on it. Per-call override: `ingest_records(..., save_records=...)`. |
+| `HEALTHDATAMODEL_SAVE_RECORDS` | `True` | Write every upload through to the legacy `Record` log. This is the rollback path, so keep it on throughout 1.0.x (1.1.0 does not change this default). `reassign_customer_health_data` and the `Record`-reading helpers (`has_records`, `get_data_source_summary`, `get_sleep_records`, `infer_resolution_minutes`, `iter_records`) depend on it. Per-call override: `ingest_records(..., save_records=...)`. |
 | `HEALTHDATAMODEL_SAVE_COMPACT` | `True` | Write every upload to `SleepDay` / `ActivityDay`. |
 | `HEALTHDATAMODEL_READ_COMPACT` | `False` | Serve the query API from the compact tables. Set it to `True` per environment once `compact_status` and `verify_compact` pass. Setting it back to `False` rolls back with no data loss. The legacy path needs PostgreSQL for activity reads. |
 | `HEALTHDATAMODEL_BACKFILL_IN_MIGRATION` | `False` | Let migration `0012` seed the compact tables from `Record` inside the migration transaction. **Only for small installs** (development, demo, CI). |
@@ -557,8 +565,9 @@ python manage.py verify_compact [--sample 20 | --customers PK ...] [--days 30]
                                 [--max-report 20]
 ```
 
-`verify_compact` compares sleep hours and wake times exactly and activity
-values within `--tolerance` (steps always allow at least 0.5, since they are
+`verify_compact` compares sleep hours and wake times exactly, the stage
+intervals of `get_sleep_intervals_by_day` (v1.1, row `sleep_stages`) exactly,
+and activity values within `--tolerance` (steps always allow at least 0.5, since they are
 stored as whole numbers). The known differences between the two read paths
 (0.1 kcal rounding, the exact-resolution grid requirement, and others) are
 listed in
